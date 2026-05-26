@@ -1,0 +1,1283 @@
+---
+title: "Creación de datasets"
+author: "Paula Gallego López"
+format: html
+editor: visual
+---
+
+# Datasets
+
+```{r}
+library(httr2)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(openxlsx)
+library(readr)
+library(mapSpain)
+library(ggplot2)
+library(sf)
+library(readxl)
+library(stringi)
+library(rvest)
+library(dplyr)
+library(stringr)
+library(purrr)
+```
+
+```{r}
+url <- "https://datos.comunidad.madrid/catalogo/api/action/datastore_search"
+```
+
+## Información de municipios
+
+### Población total, género, nacionalidad y edad
+
+```{r}
+payload <- list(
+  resource_id = "bab16922-8df1-49b5-9791-aed4edf8ced1",
+  limit = 50000,
+  filters = list(
+    `Año` = 2025,
+    `Tipo territorio` = "Municipios"
+  )
+)
+
+resp <- request(url) |>
+  req_body_json(payload) |>
+  req_perform()
+
+data <- resp_body_json(resp)
+
+cat("success:", data$success, "\n")
+cat("total encontrados:", data$result$total, "\n")
+
+df_mun <- bind_rows(data$result$records)
+```
+
+```{r}
+df_total_base <- df_mun |> filter(Edad == "Total")
+
+# Población total
+df_total <- df_total_base |>
+  filter(Nacionalidad == "Total", Sexo == "Total") |>
+  select(Territorio, poblacion_total = Valor)
+
+# Hombres
+df_hombres <- df_total_base |>
+  filter(Nacionalidad == "Total", Sexo == "Hombres") |>
+  select(Territorio, hombres = Valor)
+
+# Mujeres
+df_mujeres <- df_total_base |>
+  filter(Nacionalidad == "Total", Sexo == "Mujeres") |>
+  select(Territorio, mujeres = Valor)
+
+# Extranjeros
+df_extranjeros <- df_total_base |>
+  filter(Nacionalidad == "Extranjeros", Sexo == "Total") |>
+  select(Territorio, extranjeros = Valor)
+
+# Nacionales
+df_nacionales <- df_total_base |>
+  filter(Nacionalidad == "Españoles", Sexo == "Total") |>
+  select(Territorio, nacionales = Valor)
+```
+
+```{r}
+mapa_edades <- c(
+  "De 0-4 años"   = "bebés",  "De 5-9 años"   = "niños",  "De 10-14 años" = "niños",
+  "De 15-19 años" = "adolescentes","De 20-24 años" = "jóvenes",
+  "De 25-29 años" = "jóvenes","De 30-34 años" = "adultos","De 35-39 años" = "adultos",
+  "De 40-44 años" = "adultos","De 45-49 años" = "adultos",
+  "De 50-54 años" = "mayores","De 55-59 años" = "mayores","De 60-64 años" = "mayores",
+  "De 65-69 años" = "mayores","De 70-74 años" = "mayores","De 75-79 años" = "mayores",
+  "De 80-84 años" = "ancianos","De 85-89 años" = "ancianos","De 90-94 años" = "ancianos",
+  "De 95-99 años" = "ancianos","De 100 y más años" = "ancianos"
+)
+
+df_grupos_wide <- df_mun |>
+  filter(Nacionalidad == "Total", Sexo == "Total", Edad != "Total") |>
+  mutate(grupo_edad = mapa_edades[Edad]) |>
+  group_by(Territorio, grupo_edad) |>
+  summarise(Valor = sum(as.numeric(Valor), na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = grupo_edad, values_from = Valor, values_fill = 0)
+
+# Asegurar que existan todas las columnas
+for (col in c("bebés", "niños", "adolescentes", "jóvenes", "adultos", "mayores", "ancianos")) {
+  if (!col %in% names(df_grupos_wide)) df_grupos_wide[[col]] <- 0
+}
+```
+
+```{r}
+# Población en edad de trabajar (16-64 años) para calcular % paro
+edades_16_64 <- c(
+  "De 15-19 años", "De 20-24 años", "De 25-29 años", "De 30-34 años",
+  "De 35-39 años", "De 40-44 años", "De 45-49 años", "De 50-54 años",
+  "De 55-59 años", "De 60-64 años"
+)
+# Nota: "De 15-19 años" incluye 15 años; se usa como aproximación disponible en el dataset.
+# La parte de 15 años supone ~1/5 del grupo, por lo que el sesgo es pequeño.
+
+df_pob_16_64 <- df_mun |>
+  filter(Nacionalidad == "Total", Sexo == "Total", Edad %in% edades_16_64) |>
+  group_by(Territorio) |>
+  summarise(pob_16_64 = sum(as.numeric(Valor), na.rm = TRUE), .groups = "drop") |>
+  rename(municipio = Territorio)
+```
+
+```{r}
+df_final <- df_total |>
+  left_join(df_hombres,    by = "Territorio") |>
+  left_join(df_mujeres,    by = "Territorio") |>
+  left_join(df_extranjeros,by = "Territorio") |>
+  left_join(df_nacionales, by = "Territorio") |>
+  left_join(df_grupos_wide,by = "Territorio") |>
+  mutate(across(c(hombres, mujeres, extranjeros, nacionales, bebés,
+                  niños, adolescentes, jóvenes, adultos, mayores, ancianos),
+                ~ replace_na(as.numeric(.x), 0)),
+         poblacion_total = as.numeric(poblacion_total)) |>
+  mutate(
+    `% hombres`     = round(hombres     / poblacion_total * 100, 2),
+    `% mujeres`     = round(mujeres     / poblacion_total * 100, 2),
+    `% extranjeros` = round(extranjeros / poblacion_total * 100, 2),
+    `% nacionales`  = round(nacionales  / poblacion_total * 100, 2),
+    `% bebes`       = round(bebés       / poblacion_total * 100, 2),
+    `% niños`       = round(niños       / poblacion_total * 100, 2),
+    `% adolescentes`= round(adolescentes/ poblacion_total * 100, 2),
+    `% jovenes`     = round(jóvenes     / poblacion_total * 100, 2),
+    `% adultos`     = round(adultos     / poblacion_total * 100, 2),
+    `% mayores`     = round(mayores     / poblacion_total * 100, 2),
+    `% ancianos`    = round(ancianos    / poblacion_total * 100, 2)
+  ) |>
+  rename(municipio = Territorio) |>
+  select(municipio, poblacion_total,
+         `% hombres`, `% mujeres`, `% extranjeros`, `% nacionales`, `% bebes`,
+         `% niños`,`% adolescentes`, `% jovenes`, `% adultos`, `% mayores`, `% ancianos`) |>
+  arrange(municipio)
+
+print(head(df_final, 20))
+dim(df_final)
+```
+
+### Superficie
+
+```{r}
+url_sup <- paste0(
+  "https://datos.comunidad.madrid/catalogo/api/action/datastore_search",
+  "?id=48010e29-caa0-46c5-ab6e-f498b2dc042f",
+  "&fields=_id,municipio_nombre,municipio_codigo_ine,superficie_km2",
+  "&limit=200"
+)
+
+resp_sup <- request(url_sup) |> req_perform()
+data_sup <- resp_body_json(resp_sup)
+
+df_sup <- bind_rows(data_sup$result$records)
+print(head(df_sup))
+```
+
+```{r}
+df_sup_clean <- df_sup |>
+  rename(
+    municipio     = municipio_nombre,
+    codigo_ine    = municipio_codigo_ine,
+    superficie_km2 = superficie_km2
+  ) |>
+  mutate(superficie_km2 = as.numeric(superficie_km2))
+
+df_sup_clean <- df_sup_clean |>
+  mutate(municipio = trimws(municipio))
+
+```
+
+```{r}
+normalizar <- function(x) tolower(stri_trans_general(trimws(x), "Latin-ASCII"))
+
+df_final <- df_final |>
+  mutate(municipio_norm = normalizar(municipio)) |>
+  left_join(
+    df_sup_clean |>
+      select(municipio, codigo_ine, superficie_km2) |>
+      mutate(municipio_norm = normalizar(municipio)) |>
+      select(-municipio),
+    by = "municipio_norm"
+  ) |>
+  select(-municipio_norm)
+
+print(head(df_final, 20))
+dim(df_final)
+```
+
+### Nivel de estudios
+
+```{r}
+url_estudios <- "https://datos.comunidad.madrid/catalogo/api/action/datastore_search"
+
+payload_estudios <- list(
+  resource_id = "ea737ab7-4210-4902-b479-7fb8cbb5aa46",
+  limit = 50000,
+  filters = list(
+    `Año` = 2023,
+    `Sexo` = "Total",
+    `Tipo territorio` = "Municipios"
+  )
+)
+
+resp_est <- request(url_estudios) |>
+  req_body_json(payload_estudios) |>
+  req_perform()
+
+data_est <- resp_body_json(resp_est)
+df_est_raw <- bind_rows(data_est$result$records)
+```
+
+```{r}
+mapa_estudios <- c(
+  "Educación primaria e inferior" = "primaria_inferior",
+  "Primera etapa de educación secundaria o similar" = "secundaria_1",
+  "Segunda etapa de educación secundaria y educación postsecundaria no superior" = "secundaria_post",
+  "Educación superior" = "superior"
+)
+
+cols_estudios <- c("primaria_inferior", "secundaria_1", "secundaria_post", "superior")
+
+df_estudios_wide <- df_est_raw |>
+  mutate(nivel = mapa_estudios[`Estudios`]) |>
+  filter(!is.na(nivel)) |>
+  group_by(Territorio, nivel) |>
+  summarise(Valor = sum(as.numeric(Valor), na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = nivel, values_from = Valor, values_fill = 0) |>
+  rename(municipio = Territorio)
+
+# Asegurar que existan todas las columnas
+for (col in cols_estudios) {
+  if (!col %in% names(df_estudios_wide)) df_estudios_wide[[col]] <- 0
+}
+```
+
+```{r}
+#2024
+df_estudios1 <- read.csv("66620.csv", sep = ";", encoding = "latin1")
+df_estudios2 <- read.csv("66623.csv", sep = ";", encoding = "latin1")
+```
+
+```{r}
+df_estudios1 <- df_estudios1 |> rename(municipio = Municipios.de.500.habitantes.o.más) |> select(-Edad)
+df_estudios2 <- df_estudios2 |> rename(municipio = Municipios.entre.50.y.500.habitantes)
+df_estudios_raw <- rbind(df_estudios1, df_estudios2)
+```
+
+```{r}
+df_estudios_raw <- df_estudios_raw |> 
+  separate(col = "municipio",
+           into = c("codigo", "municipio"), 
+           sep = 5) |>
+  mutate(Total = as.numeric(gsub("\\.", "", Total))) |> 
+  select(-Sexo, -Periodo)
+```
+
+```{r}
+df_estudios_wide <- df_estudios_raw |>
+  group_by(municipio, codigo, Nivel.de.estudios) |>
+  summarise(Valor = sum(as.numeric(Total), na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = Nivel.de.estudios, values_from = Valor, values_fill = 0)
+```
+
+```{r}
+payload_pob24 <- list(
+  resource_id = "bab16922-8df1-49b5-9791-aed4edf8ced1",
+  limit = 50000,
+  filters = list(
+    `Año` = 2024,
+    `Tipo territorio` = "Municipios"
+  )
+)
+
+resp_pob24 <- request(url) |>
+  req_body_json(payload_pob24) |>
+  req_perform()
+
+data_pob24 <- resp_body_json(resp_pob24)
+
+cat("success:", data_pob24$success, "\n")
+cat("total encontrados:", data_pob24$result$total, "\n")
+
+df_pob24 <- bind_rows(data_pob24$result$records)
+
+df_total_base24 <- df_pob24 |> filter(Edad == "Total")
+
+# Población total
+df_total24 <- df_total_base24 |>
+  filter(Nacionalidad == "Total", Sexo == "Total") |>
+  select(Territorio, poblacion_total = Valor)
+```
+
+```{r}
+df_estudios_wide <- df_final |>
+  mutate(codigo_ine_5 = substr(as.character(codigo_ine), 1, 5)) |>
+  select(municipio, codigo_ine_5) |>
+  # Join con población desde df_total24 por nombre de municipio
+  left_join(df_total24, by = c("municipio" = "Territorio")) |>
+  # Join con estudios por código
+  left_join(df_estudios_wide |> select(-municipio), by = c("codigo_ine_5" = "codigo")) |>
+  mutate(
+    `% primaria_inferior`  = round(`Educación primaria e inferior` / poblacion_total * 100, 2),
+    `% secundaria_1`       = round(`Primera etapa de Educación Secundaria y similar` / poblacion_total * 100, 2),
+    `% secundaria_post`    = round(`Segunda etapa de Educación Secundaria y Educación Postsecundaria no Superior` / poblacion_total * 100, 2),
+    `% superior`           = round(`Educación superior` / poblacion_total * 100, 2)
+  ) |>
+  select(municipio, codigo_ine_5, starts_with("%"))
+```
+
+```{r}
+df_final <- df_final |>
+  left_join(df_estudios_wide, by = "municipio")
+
+print(head(df_final))
+dim(df_final)
+```
+
+### Paro
+
+```{r}
+payload_paro <- list(
+  resource_id = "4fe02826-b3c2-428b-ad5d-9243c2e49718",
+  limit = 50000,
+  filters = list(
+    `Tipo territorio` = "Municipios",
+    `Año` = 2025
+  )
+)
+
+resp_paro <- request(url) |>
+  req_body_json(payload_paro) |>
+  req_perform()
+
+data_paro <- resp_body_json(resp_paro)
+df_paro_raw <- bind_rows(data_paro$result$records)
+```
+
+```{r}
+df_paro <- df_paro_raw |>
+  select(municipio = Territorio, parados = Valor) |>
+  mutate(parados = as.numeric(parados))
+
+df_tasa_paro <- df_paro |>
+  left_join(df_pob_16_64, by = "municipio") |>
+  mutate(tasa_paro = (parados / pob_16_64) * 100) |>
+  select(municipio, tasa_paro)
+
+df_final <- df_final |>
+  left_join(df_tasa_paro, by = "municipio")
+```
+
+### Empresas
+
+```{r}
+payload_empresas <- list(
+  resource_id = "dfc9d77e-c84e-4d2d-a026-7928045432c5",
+  limit = 50000,
+  filters = list(
+    `Año` = 2024,
+    `Tipo territorio` = "Municipios",
+    `Medida` = "Unidades productivas final periodo"
+  )
+)
+
+resp_empresas <- request(url) |>
+  req_body_json(payload_empresas) |>
+  req_perform()
+
+data_empresas <- resp_body_json(resp_empresas)
+df_empresas_raw <- bind_rows(data_empresas$result$records)
+```
+
+```{r}
+payload_pob24 <- list(
+  resource_id = "bab16922-8df1-49b5-9791-aed4edf8ced1",
+  limit = 50000,
+  filters = list(
+    `Año` = 2024,
+    `Tipo territorio` = "Municipios"
+  )
+)
+
+resp_pob24 <- request(url) |>
+  req_body_json(payload_pob24) |>
+  req_perform()
+
+data_pob24 <- resp_body_json(resp_pob24)
+
+cat("success:", data_pob24$success, "\n")
+cat("total encontrados:", data_pob24$result$total, "\n")
+
+df_pob24 <- bind_rows(data_pob24$result$records)
+
+df_total_base24 <- df_pob24 |> filter(Edad == "Total")
+
+# Población total
+df_total24 <- df_total_base24 |>
+  filter(Nacionalidad == "Total", Sexo == "Total") |>
+  select(Territorio, poblacion_total = Valor)
+```
+
+```{r}
+df_empresas <- df_empresas_raw |>
+  select(municipio = Territorio, empresas = Valor) |>
+  mutate(empresas = as.numeric(empresas))
+
+df_empresas <- df_empresas |>
+  left_join(df_total24, by = c("municipio" = "Territorio")) |>
+  mutate(empresas_hab = round(empresas / poblacion_total, 2))
+
+df_final <- df_final |>
+  left_join(df_empresas, by = "municipio") |> 
+  select(-c(empresas, poblacion_total.y))
+
+print(head(df_final))
+dim(df_final)
+```
+
+### Vivienda
+
+```{r}
+url_viviendas <- "https://iestadis.edatos.io/statistical-resources/v1.0/datasets/IECM/007_000027/~latest.csv"
+# 2022
+
+df_viviendas_raw <- read.csv(url_viviendas, sep = ",", encoding = "UTF-8")
+
+cat("Columnas:", paste(names(df_viviendas_raw), collapse = ", "), "\n")
+print(head(df_viviendas_raw, 10))
+```
+
+```{r}
+payload_pob22 <- list(
+  resource_id = "bab16922-8df1-49b5-9791-aed4edf8ced1",
+  limit = 50000,
+  filters = list(
+    `Año` = 2022,
+    `Tipo territorio` = "Municipios"
+  )
+)
+
+resp_pob22 <- request(url) |>
+  req_body_json(payload_pob22) |>
+  req_perform()
+
+data_pob22 <- resp_body_json(resp_pob22)
+
+cat("success:", data_pob22$success, "\n")
+cat("total encontrados:", data_pob22$result$total, "\n")
+
+df_pob22 <- bind_rows(data_pob22$result$records)
+
+df_total_base22 <- df_pob22 |> filter(Edad == "Total")
+
+# Población total
+df_total22 <- df_total_base22 |>
+  filter(Nacionalidad == "Total", Sexo == "Total") |>
+  select(Territorio, poblacion_total = Valor)
+```
+
+```{r}
+df_viviendas <- df_viviendas_raw |>
+  filter(
+    MEDIDA_CODE == "VIVIENDAS",
+    TERRITORIO.es != "Madrid (Comunidad de)"
+  ) |>
+  select(municipio = TERRITORIO.es, viviendas = OBS_VALUE) |> mutate(viviendas = as.numeric(viviendas))
+
+df_viviendas <- df_viviendas |>
+  mutate(municipio = if_else(municipio == "Madrid (municipio)", "Madrid", municipio)) |>
+  left_join(df_total22, by = c("municipio" = "Territorio")) |> mutate(vivienda_hab = round(viviendas / poblacion_total, 2)) |> select (-viviendas, -poblacion_total)
+
+df_final <- df_final |>
+  left_join(df_viviendas, by = "municipio")
+
+print(head(df_final))
+dim(df_final)
+```
+
+### Tamaño del hogar
+
+```{r}
+payload_hogares <- list(
+  resource_id = "f3610af6-0aca-44e7-811b-6dfc0538c081",
+  limit = 50000,
+  filters = list(
+    `Tipo territorio` = "Municipios"
+  )
+)
+
+resp_hogares <- request(url) |>
+  req_body_json(payload_hogares) |>
+  req_perform()
+
+data_hogares <- resp_body_json(resp_hogares)
+df_hogares_raw <- bind_rows(data_hogares$result$records)
+```
+
+```{r}
+payload_pob21 <- list(
+  resource_id = "bab16922-8df1-49b5-9791-aed4edf8ced1",
+  limit = 50000,
+  filters = list(
+    `Año` = 2021,
+    `Tipo territorio` = "Municipios"
+  )
+)
+
+resp_pob21 <- request(url) |>
+  req_body_json(payload_pob21) |>
+  req_perform()
+
+data_pob21 <- resp_body_json(resp_pob21)
+
+cat("success:", data_pob21$success, "\n")
+cat("total encontrados:", data_pob21$result$total, "\n")
+
+df_pob21 <- bind_rows(data_pob21$result$records)
+
+df_total_base21 <- df_pob21 |> filter(Edad == "Total")
+
+# Población total
+df_total21 <- df_total_base21 |>
+  filter(Nacionalidad == "Total", Sexo == "Total") |>
+  select(Territorio, poblacion_total = Valor)
+```
+
+```{r}
+df_hogares_wide <- df_hogares_raw |>
+  mutate(
+    tamaño = case_when(
+      Tamaño == "Total"                 ~ "hogares",
+      Tamaño == "De 1 persona"          ~ "hogares_1p",
+      Tamaño == "De 2 personas"         ~ "hogares_2p",
+      Tamaño == "De 3 personas"         ~ "hogares_3p",
+      Tamaño == "De 4 personas"         ~ "hogares_4p",
+      Tamaño == "De 5 o más personas"   ~ "hogares_5p_mas"
+    )
+  ) |>
+  group_by(Territorio, tamaño) |>
+  summarise(Valor = sum(as.numeric(Valor), na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = tamaño, values_from = Valor, values_fill = 0) |>
+  rename(municipio = Territorio)
+
+cols_hogares <- c("hogares_1p", "hogares_2p", "hogares_3p", "hogares_4p", "hogares_5p_mas")
+
+df_hogares_wide <- df_hogares_wide |>
+  mutate(hogares_total = rowSums(across(all_of(cols_hogares)))) |>
+  mutate(across(all_of(cols_hogares),
+                ~ round(.x / hogares_total * 100, 2),
+                .names = "% {.col}")) |>
+  select(municipio, hogares_total, starts_with("%"))
+```
+
+```{r}
+df_hogares_wide <- df_hogares_wide |>
+  left_join(df_total21, by = c("municipio" = "Territorio")) |>
+  mutate(hogares_hab = round(hogares_total / poblacion_total, 2)) |> 
+  select(-hogares_total, -poblacion_total)
+```
+
+```{r}
+df_final <- df_final |>
+  left_join(df_hogares_wide, by = "municipio")
+
+print(head(df_final))
+dim(df_final)
+```
+
+### Renta Bruta
+
+```{r}
+payload_renta <- list(
+  resource_id = "fc9d4336-3c4a-4dd3-8f8f-dac0a4e29033",
+  limit = 50000,
+  filters = list(
+    `Año` = 2023,
+    `Tipo territorio` = "Municipios",
+    `Medida` = "Total"
+  )
+)
+
+resp_renta <- request(url) |>
+  req_body_json(payload_renta) |>
+  req_perform()
+
+data_renta <- resp_body_json(resp_renta)
+df_renta_raw <- bind_rows(data_renta$result$records)
+```
+
+```{r}
+payload_pob23 <- list(
+  resource_id = "bab16922-8df1-49b5-9791-aed4edf8ced1",
+  limit = 50000,
+  filters = list(
+    `Año` = 2023,
+    `Tipo territorio` = "Municipios"
+  )
+)
+
+resp_pob23 <- request(url) |>
+  req_body_json(payload_pob23) |>
+  req_perform()
+
+data_pob23 <- resp_body_json(resp_pob23)
+
+cat("success:", data_pob23$success, "\n")
+cat("total encontrados:", data_pob23$result$total, "\n")
+
+df_pob23 <- bind_rows(data_pob23$result$records)
+
+df_total_base23 <- df_pob23 |> filter(Edad == "Total")
+
+# Población total
+df_total23 <- df_total_base23 |>
+  filter(Nacionalidad == "Total", Sexo == "Total") |>
+  select(Territorio, poblacion_total = Valor)
+```
+
+```{r}
+df_renta <- df_renta_raw |>
+  select(municipio = Territorio, renta_bruta = Valor) |>
+  mutate(renta_bruta = as.numeric(renta_bruta))
+
+df_renta <- df_renta |>
+  left_join(df_total23, by = c("municipio" = "Territorio")) |>
+  mutate(renta_bruta_hab = round(renta_bruta / poblacion_total, 2))
+
+df_final <- df_final |>
+  left_join(df_renta, by = "municipio") |>
+  select (-renta_bruta, -poblacion_total)
+
+print(head(df_final))
+dim(df_final)
+```
+
+### Ciudad dormitorio
+
+```{r}
+# Fuente: INE - Censos de Población y Viviendas 2021
+# Archivo local cargado manualmente
+df_censo_raw <- read.xlsx(
+  "Censo_2021.xlsx",
+  sheet     = 1,
+  startRow  = 11,   # fila 11 contiene los nombres de columna
+  colNames  = TRUE
+)
+```
+
+```{r}
+df_censo <- df_censo_raw |>
+  rename(
+    municipio        = `Lugar.de.trabajo`,
+    total_censo      = `Total`,
+    mismo_mun        = `Mismo.municipio.al.de.residencia`,
+    otro_mun         = `Distinto.municipio.de.la.misma.provincia`,
+    otra_comunidad   = `Otra.comunidad`
+  ) |>
+  filter(!municipio %in% c("Municipio de residencia", "Total"), !is.na(municipio)) |>
+  mutate(
+    codigo_ine_5 = str_extract(municipio, "^\\d{5}"),
+    municipio    = trimws(sub("^\\d{5}\\s+", "", municipio)),
+    across(c(mismo_mun, otro_mun, otra_comunidad), as.numeric)
+  ) |>
+  filter(!is.na(codigo_ine_5)) |>  # elimina filas sin código
+  mutate(
+    ocupados_lugar_conocido = mismo_mun + otro_mun + otra_comunidad,
+    `% trabaja_mismo_mun`  = round(mismo_mun / ocupados_lugar_conocido * 100, 2),
+    `% trabaja_otro_lugar` = round((otro_mun + otra_comunidad) / ocupados_lugar_conocido * 100, 2)
+  ) |>
+  select(codigo_ine_5, municipio, `% trabaja_mismo_mun`, `% trabaja_otro_lugar`)
+```
+
+```{r}
+hist(df_censo$`% trabaja_mismo_mun`, breaks = 10)
+hist(log(df_censo$`% trabaja_mismo_mun`), breaks = 10)
+```
+
+```{r}
+df_censo |> arrange(`% trabaja_mismo_mun`)
+```
+
+```{r}
+df_final <- df_final |>
+  mutate(codigo_ine_5 = str_sub(as.character(codigo_ine), 1, 5)) |>
+  left_join(df_censo |> 
+      select(codigo_ine_5, `% trabaja_mismo_mun`) |>
+      mutate(ciudad_dormitorio = if_else(`% trabaja_mismo_mun` < 10, 1, 0)) |>
+      select(codigo_ine_5, ciudad_dormitorio),
+    by = "codigo_ine_5") |>
+  select(-codigo_ine_5) |>
+  mutate(ciudad_dormitorio = replace_na(ciudad_dormitorio, 0))
+
+print(head(df_final))
+dim(df_final)
+```
+
+### Cartografías
+
+#### Distancia a Madrid
+
+```{r}
+# Fuente IGN
+municipios_madrid <- esp_get_munic_siane(region = "Madrid")
+
+head(municipios_madrid)
+nrow(municipios_madrid)
+```
+
+```{r}
+# Distancia al centroide de Madrid capital (en km)
+madrid_capital <- municipios_madrid |>
+  filter(name == "Madrid") |>
+  st_centroid()
+
+municipios_centroides <- municipios_madrid |>
+  st_centroid() |>
+  mutate(
+    dist_capital_km = as.numeric(st_distance(geometry, madrid_capital$geometry)) / 1000
+  ) |>
+  st_drop_geometry() |>
+  select(name, LAU_CODE, dist_capital_km)
+
+df_final <- df_final |>
+  mutate(codigo_ine_5 = substr(as.character(codigo_ine), 1, 5)) |>
+  left_join(
+    municipios_centroides |>
+      mutate(codigo_ine_5 = as.character(LAU_CODE)) |>
+      select(codigo_ine_5, dist_capital_km),
+    by = "codigo_ine_5"
+  ) |>
+  select(-codigo_ine_5)
+
+print(head(df_final))
+```
+
+#### Distancia a hospital
+
+```{r}
+base_url <- "https://www.redaccionmedica.com"
+
+# PASO 1: extraer nombre + URL de cada hospital del listado
+pagina <- read_html(paste0(base_url, "/recursos-salud/hospitales-espana/madrid"), encoding = "UTF-8")
+
+df_links <- pagina |>
+  html_elements("a") |>
+  (\(x) tibble(
+    nombre = html_text(x, trim = TRUE),
+    url    = html_attr(x, "href")
+  ))() |>
+  filter(str_detect(nombre, "Hospital")) |>
+  filter(str_starts(url, "/recursos-salud/hospitales-espana/")) |>
+  mutate(url_completa = paste0(base_url, url)) |>
+  distinct()
+
+# PASO 2: función que entra en cada ficha y extrae el municipio
+extraer_municipio <- function(url) {
+  Sys.sleep(0.5)
+  tryCatch({
+    ficha <- read_html(url)
+    
+    texto <- ficha |>
+      html_elements("p, td, span, li") |>
+      html_text(trim = TRUE)
+    
+    linea_cp <- texto[str_detect(texto, "\\b28\\d{3}\\b")]
+    
+    if (length(linea_cp) > 0) {
+      # Captura lo que va después de "28XXX," o "28XXX "
+      municipio <- str_extract(linea_cp[1], "28\\d{3},?\\s*([^,\\n]+)") |>
+        str_remove("^28\\d{3},?\\s*") |>
+        str_trim()
+      return(municipio)
+    } else {
+      return(NA_character_)
+    }
+  }, error = function(e) NA_character_)
+}
+
+# PASO 3: iterar sobre todos los hospitales
+df_hospitales <- df_links |>
+  mutate(municipio = map_chr(url_completa, extraer_municipio))
+
+# Ver resultado
+df_hospitales |> select(nombre, municipio) |> print(n = Inf)
+
+df_hospitales <- df_hospitales |>
+  mutate(municipio = str_remove(municipio, "\\).*") |> str_trim())
+
+df_hospitales <- df_hospitales |>
+  mutate(municipio = case_when(
+    municipio == "Aravaca"  ~ "Madrid",
+    municipio == "Villalba" ~ "Collado Villalba",
+    .default = municipio
+  ))
+```
+
+```{r}
+# Municipios que tienen al menos un hospital
+municipios_con_hospital <- municipios_madrid |>
+  filter(name %in% df_hospitales$municipio) |>
+  st_centroid()
+
+# Centroides de todos los municipios
+municipios_centroides <- municipios_madrid |>
+  st_centroid()
+
+# Matriz de distancias
+dist_matrix <- st_distance(municipios_centroides, municipios_con_hospital)
+
+# Tabla con distancias por municipio
+dist_hospitales <- municipios_centroides |>
+  st_drop_geometry() |>
+  mutate(
+    dist_hosp_cercano_km   = apply(dist_matrix, 1, min) / 1000,
+    municipio_hosp_cercano = municipios_con_hospital$name[apply(dist_matrix, 1, which.min)]
+  ) |>
+  select(LAU_CODE, dist_hosp_cercano_km)
+
+df_final <- df_final |>
+  mutate(codigo_ine_5 = substr(as.character(codigo_ine), 1, 5)) |>
+  left_join(
+    dist_hospitales |>
+      mutate(codigo_ine_5 = as.character(LAU_CODE)),
+    by = "codigo_ine_5"
+  ) |>
+  select(-codigo_ine_5, -LAU_CODE)
+```
+
+```{r}
+#write.csv(df_final, "mun_info.csv", row.names = TRUE)
+```
+
+## Municipios en expansión
+
+### Población
+
+```{r}
+df_poblacion_hist <- read.csv("2881.csv", sep = ";", encoding = "latin1")
+```
+
+```{r}
+df_poblacion_hist <- df_poblacion_hist |> 
+  separate(col = "Municipios",
+           into = c("codigo", "municipio"), 
+           sep = 5) |>
+  mutate(Total = as.numeric(gsub("\\.", "", Total)))
+```
+
+```{r}
+df_pob_vars <- df_poblacion_hist |>
+  mutate (Total = as.numeric(Total)) |> 
+  arrange(municipio, Periodo) |>
+  group_by(codigo, municipio) |>
+  mutate(crec_anual = (Total - lag(Total)) / lag(Total) * 100) |>
+  summarise(
+    pob_2015          = Total[Periodo == 2015],
+    pob_2024          = Total[Periodo == 2024],
+    tasa_crec_pob     = round((pob_2024 - pob_2015) / pob_2015 * 100, 2),
+    tendencia_pob     = coef(lm(Total ~ Periodo))[2],
+    volatilidad_pob   = round(sd(crec_anual, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+```
+
+### Empresas
+
+```{r}
+payload_emp_hist <- list(
+  resource_id = "dfc9d77e-c84e-4d2d-a026-7928045432c5",
+  limit = 100000,
+  filters = list(
+    `Tipo territorio` = "Municipios"
+  )
+)
+
+resp_emp_hist <- request(url) |>
+  req_body_json(payload_emp_hist) |>
+  req_perform()
+
+df_emp_hist <- bind_rows(resp_body_json(resp_emp_hist)$result$records) |>
+  mutate(Valor = as.numeric(Valor),
+         Año   = as.integer(Año)) |>
+  select(municipio = Territorio, año = Año, medida = Medida, valor = Valor)
+
+cat("Años disponibles:", paste(sort(unique(df_emp_hist$año)), collapse = ", "), "\n")
+cat("Medidas:", paste(unique(df_emp_hist$medida), collapse = ", "), "\n")
+```
+
+```{r}
+df_emp_wide <- df_emp_hist |>
+  pivot_wider(names_from = medida, values_from = valor)
+
+df_emp_vars <- df_emp_wide |>
+  arrange(municipio, año) |>
+  group_by(municipio) |>
+  summarise(
+    # Tasas de crecimiento globales
+    tasa_crec_empresas  = round((`Unidades productivas final periodo`[año == 2024] - `Unidades productivas final periodo`[año == 2015]) / `Unidades productivas final periodo`[año == 2015] * 100, 2),
+    
+    tasa_crec_ocupados  = round((`Ocupados final periodo`[año == 2024] - `Ocupados final periodo`[año == 2015]) / `Ocupados final periodo`[año == 2015] * 100, 2),
+
+    # Saldo neto medio anual (nacen + entran - mueren - salen)
+    tasa_crec_neto_medio = round(mean(((`Unidades productivas nacen` + `Unidades productivas entran`) - (`Unidades productivas mueren` + `Unidades productivas salen`)) / `Unidades productivas inicio periodo`, na.rm = TRUE) * 100, 2))
+
+print(head(df_emp_vars))
+```
+
+### Renta bruta
+
+```{r}
+payload_renta_hist <- list(
+  resource_id = "fc9d4336-3c4a-4dd3-8f8f-dac0a4e29033",
+  limit = 100000,
+  filters = list(
+    `Tipo territorio` = "Municipios",
+    `Medida` = "Total"
+  )
+)
+
+resp_renta_hist <- request(url) |>
+  req_body_json(payload_renta_hist) |>
+  req_perform()
+
+df_renta_hist <- bind_rows(resp_body_json(resp_renta_hist)$result$records) |>
+  mutate(Valor = as.numeric(Valor),
+         Año   = as.integer(Año)) |>
+  select(municipio = Territorio, año = Año, renta_bruta = Valor)
+
+cat("Años disponibles:", paste(sort(unique(df_renta_hist$año)), collapse = ", "), "\n")
+cat("Filas:", nrow(df_renta_hist), "\n")
+```
+
+```{r}
+df_renta_vars <- df_renta_hist |>
+  group_by(municipio) |>
+  summarise(
+    renta_2015        = if(any(año == 2015)) renta_bruta[año == 2015] else NA_real_,
+    renta_2023        = if(any(año == 2023)) renta_bruta[año == 2023] else NA_real_,
+    tasa_crec_renta   = round((renta_2023 - renta_2015) / renta_2015 * 100, 2),
+    tendencia_renta   = if(sum(!is.na(renta_bruta)) > 1) coef(lm(renta_bruta ~ año))[2] else NA_real_,
+    volatilidad_renta = sd(renta_bruta, na.rm = TRUE),
+    .groups = "drop")
+```
+
+```{r}
+df_expansion <- df_final |>
+  mutate(codigo_ine_5 = substr(as.character(codigo_ine), 1, 5)) |>
+  select(municipio, codigo_ine_5) |>
+  left_join(df_pob_vars |> select(-municipio), by = c("codigo_ine_5" = "codigo")) |>
+  left_join(df_emp_vars, by = "municipio") |>
+  left_join(df_renta_vars, by = "municipio")
+```
+
+```{r}
+write.csv(df_expansion, "expansion_municipios.csv", row.names = FALSE)
+```
+
+## Servicios disponibles
+
+### Educación
+
+```{r}
+payload_educacion <- list(
+  resource_id = "28d60557-1d73-4281-ab08-6cfd3b2f5f83",
+  limit = 50000,
+  filters = list(
+    `SITUACIÓN` = "ALTA"
+  )
+)
+resp_educacion <- request(url) |>
+  req_body_json(payload_educacion) |>
+  req_perform()
+data_educacion <- resp_body_json(resp_educacion)
+```
+
+```{r}
+data_educacion$result$records |>
+  bind_rows() |>
+  distinct(TIPO_ABRV, TIPO_EXT) |>
+  arrange(TIPO_ABRV)
+```
+
+#### Infantil
+
+```{r}
+centros_infantil <- c("CP INF-PRI", "CP INF-PRI-SEC", "CPR INF", "CPR INF-PRI", "CPR INF-PRI-SEC", "CPR INF-SEC", "EEI", "EEI-CN", "EIPR")
+
+df_infantil_raw <- bind_rows(data_educacion$result$records) |>
+  filter(TIPO_ABRV %in% centros_infantil)
+```
+
+```{r}
+infantil_por_municipio <- df_infantil_raw |>
+  group_by(CDMUNI, MUNICIPIO) |>
+  summarise(
+    n_centros = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_centros))
+```
+
+#### Primaria
+
+```{r}
+centros_primaria <- c("CP INF-PRI", "CP INF-PRI-SEC", "CP PRI", "CP PRI-SEC", "CPR INF-PRI", "CPR INF-PRI-SEC", "CPR PRI", "CPR PRI-SEC", "CIMELPR PRSEC")
+
+df_primaria_raw <- bind_rows(data_educacion$result$records) |>
+  filter(TIPO_ABRV %in% centros_primaria)
+```
+
+```{r}
+primaria_por_municipio <- df_primaria_raw |>
+  group_by(CDMUNI, MUNICIPIO) |>
+  summarise(
+    n_centros     = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_centros))
+```
+
+#### Secundaria y grado medio
+
+```{r}
+centros_sec <- c("CP INF-PRI-SEC", "CP PRI-SEC", "CPR INF-PRI-SEC", "CPR INF-SEC", "CPR PRI-SEC", "IES", "CIMELPR PRSEC", "CIMPR SEC", "CPR ES", "CAU ENS. DEP. GM/SUP", "CAU ENS.DEP.G.M")
+
+df_sec_raw <- bind_rows(data_educacion$result$records) |>
+  filter(TIPO_ABRV %in% centros_sec)
+```
+
+```{r}
+sec_por_municipio <- df_sec_raw |>
+  group_by(CDMUNI, MUNICIPIO) |>
+  summarise(
+    n_centros     = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_centros))
+```
+
+### Salud
+
+#### Centros de salud
+
+```{r}
+payload_centros <- list(
+  resource_id = "631ebd15-c19f-4984-9ad5-bb4b8554b5e0",
+  limit = 50000,
+  filters = list(
+    `Año` = 2024,
+    `Tipo territorio` = "Municipios",
+    `Tipo` = "Centros de salud",
+    `Medida` = "Total"
+  )
+)
+```
+
+```{r}
+resp_centros <- request(url) |>
+  req_body_json(payload_centros) |>
+  req_perform()
+data_centros <- resp_body_json(resp_centros)
+df_centros_raw <- bind_rows(data_centros$result$records)
+```
+
+```{r}
+centros_por_municipio <- df_centros_raw |> select(Territorio, Valor) |> rename(municipio_nombre = Territorio, n_centros_salud = Valor)
+```
+
+#### Hospitales
+
+Con el web scrapping anterior
+
+```{r}
+hospitales_por_municipio <- df_hospitales |>
+  count(municipio, sort = TRUE) |>
+  rename(`n_hospitales` = n)
+```
+
+#### Farmacias
+
+```{r}
+payload_farmacias <- list(
+  resource_id = "904a161b-f339-4296-be61-1ae914494c89",
+  limit = 50000
+)
+
+resp_farmacias <- request(url) |>
+  req_body_json(payload_farmacias) |>
+  req_perform()
+data_farmacias <- resp_body_json(resp_farmacias)
+df_farmacias_raw <- bind_rows(data_farmacias$result$records)
+```
+
+```{r}
+farmacias_por_municipio <- df_farmacias_raw |> group_by(MUNICIPIO_NOMBRE) |>
+  summarise(n_farmacias = n())
+```
+
+### Transporte
+
+```{r}
+payload_transporte <- list(
+  resource_id = "97f5a0dc-c5a5-43c5-b2e3-3e62fc07c322",
+  limit = 50000,
+  filters = list(
+    `Año` = "2023",
+    `Tipo territorio` = "Municipios"
+  )
+)
+resp_transporte <- request(url) |>
+  req_body_json(payload_transporte) |>
+  req_perform()
+data_transporte <- resp_body_json(resp_transporte)
+```
+
+#### Paradas de tren
+
+```{r}
+df_tren_raw <- bind_rows(data_transporte$result$records) |>
+  filter(Medida %in% c(
+    "Estaciones de cercanías de tren",
+    "Estaciones de metro",
+    "Estaciones de metro ligero"
+  )) |>
+  select(Territorio, Medida, Valor) |>
+  pivot_wider(names_from = Medida, values_from = Valor) |>
+  rename(
+    municipio_nombre = Territorio,
+    n_cercanias      = `Estaciones de cercanías de tren`,
+    n_metro          = `Estaciones de metro`,
+    n_ligero         = `Estaciones de metro ligero`
+  )
+```
+
+```{r}
+tren_por_municipio <- df_tren_raw |> mutate(n_tren = n_cercanias + n_metro + n_ligero) |> select(municipio_nombre, n_tren)
+```
+
+#### Paradas de autobús
+
+```{r}
+df_autobus_raw <- bind_rows(data_transporte$result$records) |>
+  filter(Medida == "Paradas de autobús")
+```
+
+```{r}
+autobus_por_municipio <- df_autobus_raw |> select(Territorio, Valor) |> rename(municipio_nombre = Territorio, n_autobus = Valor)
+```
+
+#### Total líneas
+
+```{r}
+df_lineas_raw <- bind_rows(data_transporte$result$records) |>
+  filter(Medida == "Total líneas")
+```
+
+```{r}
+lineas_por_municipio <- df_lineas_raw |> select(Territorio, Valor) |> rename(municipio_nombre = Territorio, n_lineas = Valor)
+```
+
+#### Líneas interurbanas
+
+```{r}
+df_interurbanas_raw <- bind_rows(data_transporte$result$records) |>
+  filter(Medida == "Líneas interurbanas")
+```
+
+```{r}
+interurbanas_por_municipio <- df_interurbanas_raw |> select(Territorio, Valor) |> rename(municipio_nombre = Territorio, n_interurbanas = Valor)
+```
+
+### Dataset final
+
+```{r}
+df_servicios <- df_final |>
+  select(municipio, codigo_ine) |>
+  mutate(
+    cod3           = as.integer(str_sub(str_pad(as.character(codigo_ine), 6, "left", "0"), 3, 5)),
+    municipio_norm = normalizar(municipio)
+  ) |>
+
+  # Educación
+  left_join(
+    infantil_por_municipio |>
+      mutate(cod3 = as.integer(CDMUNI)) |>
+      group_by(cod3) |>
+      summarise(n_centros_infantil = sum(n_centros, na.rm = TRUE), .groups = "drop"),
+    by = "cod3"
+  ) |>
+  left_join(
+    primaria_por_municipio |>
+      mutate(cod3 = as.integer(CDMUNI)) |>
+      group_by(cod3) |>
+      summarise(n_centros_primaria = sum(n_centros, na.rm = TRUE), .groups = "drop"),
+    by = "cod3"
+  ) |>
+  left_join(
+    sec_por_municipio |>
+      mutate(cod3 = as.integer(CDMUNI)) |>
+      group_by(cod3) |>
+      summarise(n_centros_sec = sum(n_centros, na.rm = TRUE), .groups = "drop"),
+    by = "cod3"
+  ) |>
+
+  # Salud
+  left_join(
+    centros_por_municipio |>
+      mutate(municipio_norm = normalizar(municipio_nombre)) |>
+      select(municipio_norm, n_centros_salud),
+    by = "municipio_norm"
+  ) |>
+  left_join(
+    hospitales_por_municipio |>
+      mutate(municipio_norm = normalizar(municipio)) |>
+      select(municipio_norm, n_hospitales),
+    by = "municipio_norm"
+  ) |>
+  left_join(
+    farmacias_por_municipio |>
+      mutate(municipio_norm = normalizar(MUNICIPIO_NOMBRE)) |>
+      select(municipio_norm, n_farmacias),
+    by = "municipio_norm"
+  ) |>
+
+  # Transporte
+  left_join(
+    tren_por_municipio |>
+      mutate(municipio_norm = normalizar(municipio_nombre)) |>
+      select(municipio_norm, n_tren),
+    by = "municipio_norm"
+  ) |>
+  left_join(
+    autobus_por_municipio |>
+      mutate(municipio_norm = normalizar(municipio_nombre)) |>
+      select(municipio_norm, n_autobus),
+    by = "municipio_norm"
+  ) |>
+  left_join(
+    lineas_por_municipio |>
+      mutate(municipio_norm = normalizar(municipio_nombre)) |>
+      select(municipio_norm, n_lineas),
+    by = "municipio_norm"
+  ) |>
+  left_join(
+    interurbanas_por_municipio |>
+      mutate(municipio_norm = normalizar(municipio_nombre)) |>
+      select(municipio_norm, n_interurbanas),
+    by = "municipio_norm"
+  ) |>
+
+  select(-cod3, -municipio_norm) |>
+  mutate(across(starts_with("n_"), ~ replace_na(as.numeric(.x), 0)))
+
+print(head(df_servicios))
+dim(df_servicios)
+```
+
+```{r}
+write.csv(df_servicios, "servicios_municipios.csv", row.names = FALSE)
+```

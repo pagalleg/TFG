@@ -1,0 +1,602 @@
+---
+title: "Análisis inversión"
+format: html
+editor: visual
+---
+
+# Análisis inversión por municipio
+
+```{r}
+library(tidyverse)
+library(sf)
+library(mapSpain)
+library(ggrepel)
+library(patchwork)
+library(scales)
+library(classInt)
+```
+
+## Carga de datos
+
+```{r}
+exp_data <- readRDS("expansion_export.rds")
+pred_data <- readRDS("resultados_prediccion.rds")
+```
+
+```{r}
+df_pca <- exp_data$df_pca
+resultados_pred_n <- pred_data
+```
+
+```{r}
+etiquetas_servicio <- c(
+  infantil      = "Ed. infantil",
+  primaria      = "Ed. primaria",
+  secundaria    = "Ed. secundaria",
+  centros_salud = "Centros salud",
+  hospitales    = "Hospitales",
+  farmacias     = "Farmacias",
+  tren          = "Tren",
+  autobus       = "Autobús",
+  lineas        = "Líneas bus",
+  interurbanas  = "Interurbanas"
+)
+```
+
+```{r}
+df_base <- df_pca |>
+  select(municipio, LAU_CODE, PC1, PC2, cluster_label,
+         tasa_crec_pob, tasa_crec_empresas, tasa_crec_ocupados,
+         tasa_crec_renta_imp) |>
+  left_join(resultados_pred_n, by = c("municipio", "LAU_CODE"))
+```
+
+```{r}
+df_largo <- df_base |>
+  pivot_longer(
+    cols      = starts_with("n_deficit_"),
+    names_to  = "servicio",
+    values_to = "deficit"
+  ) |>
+  mutate(
+    servicio       = str_remove(servicio, "^n_deficit_"),
+    servicio_label = etiquetas_servicio[servicio],
+    categoria      = case_when(
+      servicio %in% c("infantil", "primaria", "secundaria")          ~ "Educación",
+      servicio %in% c("centros_salud", "hospitales", "farmacias")    ~ "Sanidad",
+      servicio %in% c("tren", "autobus", "lineas", "interurbanas")   ~ "Transporte"))
+```
+
+## Scatter plot
+
+```{r}
+resumen_mun <- df_largo |>
+  group_by(
+    municipio,
+    LAU_CODE,
+    PC1,
+    PC2,
+    cluster_label,
+    poblacion_total
+  ) |>
+  summarise(
+    n_servicios_deficit   = sum(deficit < 0, na.rm = TRUE),
+    n_servicios_cubiertos = sum(deficit >= 0, na.rm = TRUE),
+    balance_total         = sum(deficit, na.rm = TRUE),
+
+    # magnitud total del déficit (en negativo)
+    deficit_puro = sum(pmin(deficit, 0), na.rm = TRUE),
+
+    # magnitud total del superávit (en positivo)
+    superavit_puro = sum(pmax(deficit, 0), na.rm = TRUE),
+
+    .groups = "drop"
+  ) |>
+  mutate(
+
+    # CUADRANTES
+
+    cuadrante = case_when(
+      PC1 >= 0 & balance_total <  0 ~ "Alta expansión\nAlto déficit",
+      PC1 <  0 & balance_total <  0 ~ "Baja expansión\nAlto déficit",
+      PC1 >= 0 & balance_total >= 0 ~ "Alta expansión\nBuen servicio",
+      PC1 <  0 & balance_total >= 0 ~ "Baja expansión\nBuen servicio"
+    ),
+
+    # NECESIDAD
+
+    intensidad =
+      abs(deficit_puro) / log1p(poblacion_total),
+
+    amplitud =
+      n_servicios_deficit /
+      (n_servicios_deficit + n_servicios_cubiertos),
+
+    score_intensidad =
+      (intensidad - min(intensidad)) /
+      (max(intensidad) - min(intensidad)) * 100,
+
+    score_amplitud =
+      (amplitud - min(amplitud)) /
+      (max(amplitud) - min(amplitud)) * 100,
+
+    # media
+    score_necesidad =
+      0.5 * score_intensidad +
+      0.5 * score_amplitud,
+
+    # EXPANSIÓN
+    
+    score_expansion =
+      (PC1 - min(PC1)) /
+      (max(PC1) - min(PC1)) * 100,
+
+    superavit_rel =
+      superavit_puro / log1p(poblacion_total),
+
+    superavit_norm =
+      (superavit_rel - min(superavit_rel)) /
+      (max(superavit_rel) - min(superavit_rel)),
+
+    # ajuste por superávit
+    # mucho superávit = menor urgencia
+    score_expansion_adj =
+      score_expansion *
+      (1 - superavit_norm),
+
+    # SCORE FINAL
+
+    # media
+    score_inversion =
+      0.5 * score_necesidad +
+      0.5 * score_expansion_adj
+  ) |>
+  arrange(desc(score_inversion))
+```
+
+```{r}
+destacados <- bind_rows(
+  # En los déficit: los más urgentes (más negativos)
+  resumen_mun |>
+    filter(str_detect(cuadrante, "Alto déficit")) |>
+    slice_min(balance_total, n = 5),
+  
+  # En alta expansión + buen servicio: los más superávit
+  resumen_mun |>
+    filter(cuadrante == "Alta expansión\nBuen servicio") |>
+    slice_max(balance_total, n = 5),
+  
+  # Baja expansión + buen servicio
+  resumen_mun |>
+    filter(cuadrante == "Baja expansión\nBuen servicio") |>
+    slice_max(balance_total, n = 3),
+  
+  # Score de inversión más alto y bajo
+  resumen_mun |>
+    slice_max(score_inversion, n = 10),
+  resumen_mun |>
+    slice_min(score_inversion, n = 5)
+) |>
+  distinct(municipio) |>
+  pull(municipio)
+```
+
+```{r}
+resumen_mun |>
+  filter(municipio != "Madrid") |>
+  mutate(etiqueta = ifelse(municipio %in% destacados, municipio, "")) |>
+  ggplot(aes(x = PC1, y = balance_total,
+             color = score_inversion,
+             size = log1p(poblacion_total), label = etiqueta)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  # Sombreado de cuadrantes
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = -Inf, ymax = 0,
+           fill = "#fdae61", alpha = 0.06) +
+  annotate("rect", xmin = 0,   xmax = Inf, ymin = -Inf, ymax = 0,
+           fill = "#d7191c", alpha = 0.06) +
+  annotate("rect", xmin = 0,   xmax = Inf, ymin = 0,    ymax = Inf,
+           fill = "#1a9641", alpha = 0.06) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = 0,    ymax = Inf,
+           fill = "#92c5de", alpha = 0.06) +
+  # Etiquetas de cuadrante en las esquinas
+  annotate("text", x = Inf,  y = -Inf, hjust = 1.1, vjust = -0.5,
+           label = "Alta expansión\nAlto déficit",  color = "#d7191c", size = 3, fontface = "bold") +
+  annotate("text", x = -Inf, y = -Inf, hjust = -0.1, vjust = -0.5,
+           label = "Baja expansión\nAlto déficit",  color = "#fdae61", size = 3, fontface = "bold") +
+  annotate("text", x = Inf,  y = Inf,  hjust = 1.1,  vjust = 1.5,
+           label = "Alta expansión\nBuen servicio", color = "#1a9641", size = 3, fontface = "bold") +
+  annotate("text", x = -Inf, y = Inf,  hjust = -0.1, vjust = 1.5,
+           label = "Baja expansión\nBuen servicio", color = "#92c5de", size = 3, fontface = "bold") +
+  geom_point(alpha = 0.9) +
+  geom_text_repel(size = 2.8, max.overlaps = 15,
+                  segment.color = "grey60", segment.size = 0.3) +
+  scale_color_gradient2( 
+    low      = "#1a9641",
+    mid      = "#f5b942",
+    high     = "#d7191c",
+    midpoint = 50,
+    name     = "Score\ninversión"
+  ) +
+  scale_size_continuous(range = c(1.5, 7), guide = "none") +
+  labs(
+    title    = "Expansión vs Balance de servicios",
+    subtitle = "Tamaño = población (log)",
+    x        = "Índice de expansión",
+    y        = "Balance de servicios"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "right")
+```
+
+```{r}
+resumen_mun |>
+  count(cuadrante) |>
+  arrange(desc(n))
+```
+
+### Mapas con tramificación Fisher (classInt)
+
+```{r}
+# Goodness of Variance Fit (GVF) para distintos números de clases
+# GVF = 1 - (varianza intraclases / varianza total)
+
+x <- resumen_mun$score_inversion |> na.omit() |> as.numeric()
+
+calc_gvf <- function(x, k) {
+  ci   <- classIntervals(x, n = k, style = "fisher")
+  brks <- ci$brks
+  ssw  <- map_dbl(seq_len(length(brks) - 1), function(i) {
+    vals <- x[x >= brks[i] & x < brks[i + 1]]
+    if (length(vals) < 2) return(0)
+    var(vals) * (length(vals) - 1)
+  })
+  sst  <- var(x) * (length(x) - 1)
+  1 - sum(ssw) / sst
+}
+
+k_max     <- min(10, length(unique(x)) - 1)
+gvf_por_k <- map_dfr(2:k_max, ~ tibble(k = .x, gvf = calc_gvf(x, .x)))
+
+ggplot(gvf_por_k, aes(x = k, y = gvf)) +
+  geom_line(color = "steelblue") +
+  geom_point(size = 3, color = "steelblue") +
+  geom_vline(xintercept = 5, linetype = "dashed", color = "firebrick") +
+  scale_x_continuous(breaks = 2:k_max) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title    = "Bondad de ajuste Fisher (GVF) según número de clases",
+    x        = "Número de clases (k)",
+    y        = "GVF (varianza explicada entre clases)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+fisher_breaks <- function(x, n = 5) {
+  x_valid <- x[!is.na(x)]
+  if (length(unique(x_valid)) < n) n <- length(unique(x_valid))
+  ci <- classIntervals(x_valid, n = n, style = "fisher")
+  ci$brks
+}
+
+# Paleta manual para los tramos
+paleta_urgencia <- c("#1a9641", "#a6d96a", "#ffffbf", "#fdae61", "#d7191c")
+```
+
+```{r}
+municipios_mad <- esp_get_munic(region = "Madrid") |>
+  st_transform(crs = 25830) |>
+  mutate(LAU_CODE = as.character(LAU_CODE)) |>
+  left_join(
+    resumen_mun |> select(LAU_CODE, score_inversion, n_servicios_deficit, PC1),
+    by = "LAU_CODE"
+  )
+
+brks_score <- fisher_breaks(municipios_mad$score_inversion, n = 5)
+
+municipios_mad <- municipios_mad |>
+  mutate(tramo_score = cut(score_inversion,
+                           breaks         = brks_score,
+                           include.lowest = TRUE,
+                           labels         = FALSE))
+
+etiq_score <- imap_chr(seq_len(length(brks_score) - 1), function(i, ...) {
+  sprintf("[%.1f, %.1f]", brks_score[i], brks_score[i + 1])
+})
+
+municipios_mad <- municipios_mad |>
+  mutate(tramo_label = factor(etiq_score[tramo_score], levels = etiq_score))
+
+p_mapa_score <- ggplot(municipios_mad) +
+  geom_sf(aes(fill = tramo_label), color = "white", linewidth = 0.1) +
+  scale_fill_manual(
+    values   = paleta_urgencia,
+    na.value = "grey88",
+    name     = "Score inversión\n(tramos Fisher)",
+    drop     = FALSE
+  ) +
+  labs(
+    title    = "Score de prioridad de inversión",
+    subtitle = "Rojo = más urgente"
+  ) +
+  theme_void(base_size = 10) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey40", size = 8),
+    legend.position = "right"
+  )
+
+print(p_mapa_score)
+```
+
+## Score por categoría
+
+```{r}
+score_cat <- df_largo |>
+  group_by(municipio, LAU_CODE, categoria) |>
+  summarise(
+    balance_cat         = sum(deficit, na.rm = TRUE),
+    n_deficit_cat       = sum(deficit < 0, na.rm = TRUE),
+    n_total_cat         = n(),
+
+    # déficit y superávit de la categoría
+    deficit_puro_cat    = sum(pmin(deficit, 0), na.rm = TRUE),
+    superavit_puro_cat  = sum(pmax(deficit, 0), na.rm = TRUE),
+
+    .groups = "drop"
+  ) |>
+  left_join(
+    resumen_mun |>
+      select(municipio, PC1, poblacion_total),
+    by = "municipio"
+  ) |>
+  group_by(categoria) |>
+  mutate(
+
+    # EXPANSIÓN
+
+    score_expansion =
+      (PC1 - min(PC1, na.rm = TRUE)) /
+      (max(PC1, na.rm = TRUE) -
+         min(PC1, na.rm = TRUE)) * 100,
+
+    superavit_rel_cat =
+      superavit_puro_cat /
+      log1p(poblacion_total),
+
+    superavit_norm_cat =
+      (superavit_rel_cat -
+         min(superavit_rel_cat, na.rm = TRUE)) /
+      (max(superavit_rel_cat, na.rm = TRUE) -
+         min(superavit_rel_cat, na.rm = TRUE)),
+
+    # el superávit reduce expansión
+    score_expansion_adj = score_expansion * (1 - superavit_norm_cat),
+
+    # NECESIDAD
+
+    intensidad_cat =
+      abs(deficit_puro_cat) /
+      log1p(poblacion_total),
+
+    amplitud_cat =
+      n_deficit_cat / n_total_cat,
+
+    score_intensidad_cat =
+      (intensidad_cat -
+         min(intensidad_cat, na.rm = TRUE)) /
+      (max(intensidad_cat, na.rm = TRUE) -
+         min(intensidad_cat, na.rm = TRUE)) * 100,
+
+    score_amplitud_cat =
+      (amplitud_cat -
+         min(amplitud_cat, na.rm = TRUE)) /
+      (max(amplitud_cat, na.rm = TRUE) -
+         min(amplitud_cat, na.rm = TRUE)) * 100,
+
+    score_necesidad =
+      0.5 * score_intensidad_cat +
+      0.5 * score_amplitud_cat,
+
+    # SCORE FINAL
+
+    score_cat =
+      0.5 * score_expansion_adj +
+      0.5 * score_necesidad
+  ) |>
+  ungroup()
+```
+
+```{r}
+municipios_mad <- esp_get_munic(region = "Madrid") |>
+  st_transform(crs = 25830) |>
+  mutate(LAU_CODE = as.character(LAU_CODE))
+
+municipios_cat <- municipios_mad |>
+  left_join(
+    score_cat |>
+      select(LAU_CODE, categoria, score_cat),
+    by = "LAU_CODE"
+  ) |>
+  filter(
+    !is.na(categoria),
+    !is.na(score_cat))
+
+breaks_cat <- municipios_cat |>
+  st_drop_geometry() |>
+  group_by(categoria) |>
+  summarise(
+    
+    n_obs   = n(),
+    n_unicos = n_distinct(score_cat),
+    
+    brks = list({
+        k <- min(5, n_unicos - 1)
+        if (k < 2) {
+        range(score_cat, na.rm = TRUE)
+      } else {
+        fisher_breaks(score_cat, n = k)
+      }
+      
+    }),
+    
+    .groups = "drop"
+  )
+
+municipios_cat <- municipios_cat |>
+  left_join(breaks_cat, by = "categoria") |>
+  rowwise() |>
+  mutate(
+    
+    tramo_score = if (length(unique(brks)) < 2) {
+      NA_integer_
+    } else {
+      cut(
+        score_cat,
+        breaks = brks,
+        include.lowest = TRUE,
+        labels = FALSE
+      )
+    },
+    
+    tramo_label = ifelse(
+      is.na(tramo_score),
+      NA,
+      sprintf(
+        "[%.1f, %.1f]",
+        brks[tramo_score],
+        brks[tramo_score + 1]
+      )
+    )
+    
+  ) |>
+  ungroup()
+
+labels_levels <- municipios_cat |>
+  st_drop_geometry() |>
+  filter(!is.na(tramo_label)) |>
+  distinct(tramo_score, tramo_label) |>
+  arrange(tramo_score) |>
+  pull(tramo_label)
+
+municipios_cat <- municipios_cat |>
+  mutate(
+    tramo_label = factor(
+      tramo_label,
+      levels = labels_levels
+    )
+  )
+
+p_mapa_cat <- ggplot(municipios_cat) +
+  
+  geom_sf(
+    aes(fill = factor(tramo_score)),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  
+  facet_wrap(~ categoria) +
+  
+  scale_fill_manual(
+    values = paleta_urgencia,
+    na.value = "grey90",
+    drop = FALSE,
+    name = "Urgencia",
+    labels = c(
+      "Muy baja",
+      "Baja",
+      "Media",
+      "Alta",
+      "Muy alta"
+    )
+  ) +
+  
+  labs(
+    title = "Score de prioridad de inversión por categoría"
+  ) +
+  
+  theme_void(base_size = 10) +
+  
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      color = "grey40",
+      size = 8
+    ),
+    
+    strip.text = element_text(
+      face = "bold"
+    ),
+    legend.position = "right"
+  )
+
+print(p_mapa_cat)
+```
+
+```{r}
+score_cat |>
+  group_by(categoria) |>
+  summarise(
+    
+    n_municipios = n(),
+    
+    score_medio = mean(score_cat, na.rm = TRUE),
+    score_sd    = sd(score_cat, na.rm = TRUE),
+    
+    balance_total = sum(balance_cat, na.rm = TRUE),
+    
+    porcentaje_deficit = mean(balance_cat < 0, na.rm = TRUE) * 100,
+    
+    municipios_con_deficit = sum(balance_cat < 0, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) |>
+  arrange(desc(score_medio))
+```
+
+```{r}
+score_cat |>
+  group_by(categoria) |>
+  summarise(
+    
+    n_municipios = n(),
+    
+    score_min = min(score_cat, na.rm = TRUE),
+    score_max = max(score_cat, na.rm = TRUE),
+    score_medio = mean(score_cat, na.rm = TRUE),
+    
+    balance_total = sum(balance_cat, na.rm = TRUE),
+    deficit_medio = mean(balance_cat, na.rm = TRUE),
+    
+    municipios_con_deficit = sum(n_deficit_cat > 0, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) |>
+  arrange(desc(score_medio))
+```
+
+```{r}
+score_cat |>
+  group_by(categoria) |>
+  slice_min(score_cat, n = 1) |>
+  select(municipio, categoria, PC1, balance_cat, score_expansion, score_necesidad, score_cat)
+```
+
+```{r}
+score_cat |>
+  group_by(categoria) |>
+  slice_max(score_cat, n = 1) |>
+  select(municipio, categoria, PC1, balance_cat, score_expansion_adj, score_necesidad, score_cat)
+```
+
+```{r}
+resumen_mun |> 
+  slice_max(score_inversion, n = 10) |>
+  select(municipio, n_servicios_deficit, n_servicios_cubiertos, deficit_puro, superavit_puro, score_necesidad, score_expansion_adj, score_inversion)
+```

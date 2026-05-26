@@ -1,0 +1,1789 @@
+---
+title: "Municipios en expansión"
+author: "Paula Gallego López"
+format: html
+editor: visual
+---
+
+# Modelos de servicios en la Comunidad de Madrid
+
+```{r}
+library(skimr)
+library(visdat)
+library(ggplot2)
+library(corrplot)
+library(patchwork)
+library(ggrepel)
+library(scales)
+library(moments)
+library(mapSpain)
+library(sf)
+library(spdep)
+library(tidymodels)
+library(spatialsample)
+library(vip)
+library(rpart.plot)
+library(tidyverse)
+library(ranger)
+library(vip)
+library(pdp)
+library(iml)
+library(patchwork)
+library(listenv)
+```
+
+```{r}
+mun_info  <- read_csv("mun_info.csv")
+servicios <- read_csv("servicios_municipios.csv")
+```
+
+```{r}
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflicts_prefer(rlang::set_names)
+#detach("package:bit64", unload = TRUE)
+```
+
+```{r}
+mun_info <- mun_info |>
+  rename(poblacion_total = poblacion_total.x) |>
+  select(-`...1`)
+
+df <- inner_join(servicios, mun_info, by = "municipio") |> 
+  rename(codigo_ine = codigo_ine.x) |> 
+  select(-codigo_ine.y)
+ 
+TARGETS <- c("n_centros_infantil","n_centros_primaria","n_centros_sec","n_centros_salud","n_hospitales","n_farmacias","n_tren","n_autobus","n_lineas","n_interurbanas")
+```
+
+## EDA
+
+```{r}
+skim(df)
+```
+
+```{r}
+skim(mun_info)
+```
+
+```{r}
+vis_dat(df |>  select(-municipio, -codigo_ine)) +
+  labs(title    = "Tipos de variables y valores perdidos", subtitle = paste(sum(is.na(df)), "NA en total")) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 6))
+
+```
+
+```{r}
+conflicts_prefer(moments::skewness)
+for (t in TARGETS) {
+  
+  x <- as.numeric(df[[t]])
+  
+  pct_zero  <- round(mean(x == 0) * 100, 1)
+  skew_orig <- round(skewness(x), 1)
+  skew_log  <- round(skewness(log1p(x)), 1)
+  
+  p_o <- ggplot(data.frame(x), aes(x)) +
+    geom_histogram(bins = 25, fill = "#5b8dd9", color = "white") +
+    labs(title = paste0("Original\nskew=", skew_orig, ", zeros=", pct_zero, "%"),
+         x = NULL, y = "n") +
+    theme_minimal(base_size = 9)
+  
+  p_l <- ggplot(data.frame(x), aes(log1p(x))) +
+    geom_histogram(bins = 25, fill = "#27ae60", color = "white") +
+    labs(title = paste0("log1p\nskew=", skew_log),
+         x = "log1p(valor)", y = "n") +
+    theme_minimal(base_size = 9)
+  
+  p_combined <- (p_o + p_l) +
+    plot_annotation(
+      title = t,
+      theme = theme(plot.title = element_text(face = "bold", size = 11))
+    )
+  
+  print(p_combined)
+}
+```
+
+```{r}
+for (t in names(mun_info |> select(-municipio, -codigo_ine))){
+  
+  x <- as.numeric(df[[t]])
+  
+  pct_zero  <- round(mean(x == 0) * 100, 1)
+  skew_orig <- round(skewness(x), 1)
+  skew_log  <- round(skewness(log1p(x)), 1)
+  
+  p_o <- ggplot(data.frame(x), aes(x)) +
+    geom_histogram(bins = 25, fill = "#5b8dd9", color = "white") +
+    labs(title = paste0("Original\nskew=", skew_orig, ", zeros=", pct_zero, "%"),
+         x = NULL, y = "n") +
+    theme_minimal(base_size = 9)
+  
+  p_l <- ggplot(data.frame(x), aes(log1p(x))) +
+    geom_histogram(bins = 25, fill = "#27ae60", color = "white") +
+    labs(title = paste0("log1p\nskew=", skew_log),
+         x = "log1p(valor)", y = "n") +
+    theme_minimal(base_size = 9)
+  
+  p_combined <- (p_o + p_l) +
+    plot_annotation(
+      title = t,
+      theme = theme(plot.title = element_text(face = "bold", size = 11))
+    )
+  
+  print(p_combined)
+}
+```
+
+```{r}
+data_corr <- mun_info |>
+  select(-municipio, -codigo_ine) |>
+  mutate(across(-c(starts_with("%"), starts_with("dist_")), log1p))
+
+corr_matrix <- cor(data_corr, use = "complete.obs")
+
+corrplot(
+  corr_matrix,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.cex = .75,
+  col = colorRampPalette(c("#d6604d","white","#2166ac"))(200),
+  addCoef.col = "black",
+  number.cex = 0.3,
+  number.digits = 1,
+  title = "Correlaciones entre variables (log1p parcial)",
+  mar = c(0,0,2,0)
+)
+```
+
+```{r}
+mun_info <- mun_info |> select(-'% hombres', -'% extranjeros', -'hogares_hab')
+```
+
+### Log en x
+
+```{r}
+df_cor <- df |>  select(-municipio, -codigo_ine, -'% hombres', -'% extranjeros', -'hogares_hab')
+```
+
+```{r}
+corr_matrix <- cor(df_cor|> mutate(across(-c(starts_with("%"), starts_with("dist_"), starts_with("n_")), log1p)), use = "complete.obs")
+
+vars_n <- grep("^n_", names(df_cor), value = TRUE)
+vars_resto <- setdiff(names(df_cor), vars_n)
+sub_corr_matrix <- corr_matrix[vars_n, vars_resto]
+```
+
+```{r}
+corrplot(
+  sub_corr_matrix,
+  method = "color",
+  tl.col = "black",
+  tl.cex = 0.7,
+  col = colorRampPalette(c("#d6604d","white","#2166ac"))(200),
+  addCoef.col = "black",
+  number.cex = 0.5,
+  number.digits = 1,
+  title = "Correlación: Log en x",
+  mar = c(0,0,2,0)
+)
+```
+
+#### Sin Madrid
+
+```{r}
+df_cor_sinM <- df |> filter(municipio != "Madrid") |>   select(-municipio, -codigo_ine, -'% hombres', -'% extranjeros', -'hogares_hab')
+
+corr_matrix <- cor(df_cor_sinM |> mutate(across(-c(starts_with("%"), starts_with("dist_"), starts_with("n_")), log1p)), use = "complete.obs")
+
+vars_n <- grep("^n_", names(df_cor_sinM), value = TRUE)
+vars_resto <- setdiff(names(df_cor_sinM), vars_n)
+sub_corr_matrix <- corr_matrix[vars_n, vars_resto]
+
+corrplot(
+  sub_corr_matrix,
+  method = "color",
+  tl.col = "black",
+  tl.cex = 0.7,
+  col = colorRampPalette(c("#d6604d","white","#2166ac"))(200),
+  addCoef.col = "black",
+  number.cex = 0.5,
+  number.digits = 1,
+  title = "Correlación: Log en x sin Madrid",
+  mar = c(0,0,2,0)
+)
+```
+
+### Log en x e y
+
+```{r}
+corr_matrix <- cor(df_cor |>
+  mutate(across(-c(starts_with("%"), starts_with("dist_")), log1p)), use = "complete.obs")
+
+vars_n <- grep("^n_", names(df_cor), value = TRUE)
+vars_resto <- setdiff(names(df_cor), vars_n)
+sub_corr_matrix <- corr_matrix[vars_n, vars_resto]
+
+corrplot(
+  sub_corr_matrix,
+  method = "color",
+  tl.col = "black",
+  tl.cex = 0.7,
+  col = colorRampPalette(c("#d6604d","white","#2166ac"))(200),
+  addCoef.col = "black",
+  number.cex = 0.5,
+  number.digits = 1,
+  title = "Correlación: Log en x e y",
+  mar = c(0,0,2,0)
+)
+```
+
+#### Sin Madrid
+
+```{r}
+corr_matrix <- cor(df_cor_sinM |> mutate(across(-c(starts_with("%"), starts_with("dist_")), log1p)), use = "complete.obs")
+
+vars_n <- grep("^n_", names(df_cor_sinM), value = TRUE)
+vars_resto <- setdiff(names(df_cor_sinM), vars_n)
+sub_corr_matrix <- corr_matrix[vars_n, vars_resto]
+
+corrplot(
+  sub_corr_matrix,
+  method = "color",
+  tl.col = "black",
+  tl.cex = 0.7,
+  col = colorRampPalette(c("#d6604d","white","#2166ac"))(200),
+  addCoef.col = "black",
+  number.cex = 0.5,
+  number.digits = 1,
+  title = "Correlación: Log en x e y sin Madrid",
+  mar = c(0,0,2,0)
+)
+```
+
+### Log en x e y y Ratios
+
+```{r}
+ratios <- df_cor |> mutate(across(-c(starts_with("%"), starts_with("dist_")), log1p)) |> 
+  mutate(
+    ratio_infantil = (n_centros_infantil / poblacion_total) * 1000,
+    ratio_primaria = (n_centros_primaria / poblacion_total) * 1000,
+    ratio_secundaria = (n_centros_sec / poblacion_total) * 1000,
+    ratio_centros_salud = (n_centros_salud / poblacion_total) * 1000,
+    ratio_hospitales = (n_hospitales / poblacion_total) * 1000,
+    ratio_farmacias = (n_farmacias / poblacion_total) * 1000,
+    ratio_tren = (n_tren / poblacion_total) * 1000,
+    ratio_autobus = (n_autobus / poblacion_total) * 1000,
+    ratio_lineas = (n_lineas / poblacion_total) * 1000,
+    ratio_interurbanas = (n_interurbanas / poblacion_total) * 1000,
+  ) |>
+  select(-starts_with("n_"), -poblacion_total)
+
+corr_ratios <- cor(ratios, use = "complete.obs")
+```
+
+```{r}
+vars_ratio <- grep("^ratio_", names(ratios), value = TRUE)
+vars_resto <- setdiff(names(ratios), vars_ratio)
+sub_corr_matrix <- corr_ratios[vars_ratio, vars_resto]
+```
+
+```{r}
+corrplot(
+  sub_corr_matrix,
+  method = "color",
+  tl.col = "black",
+  tl.cex = 0.7,
+  col = colorRampPalette(c("#d6604d","white","#2166ac"))(200),
+  addCoef.col = "black",
+  number.cex = 0.5,
+  number.digits = 1,
+  title = "Correlación: Ratios con log en x e y",
+  mar = c(0,0,2,0)
+)
+```
+
+### Log en x e y y Ratios sin Madrid
+
+```{r}
+ratios_sinMad <- df_cor_sinM |> mutate(across(-c(starts_with("%"), starts_with("dist_")), log1p)) |> 
+  mutate(
+    ratio_infantil = (n_centros_infantil / poblacion_total) * 1000,
+    ratio_primaria = (n_centros_primaria / poblacion_total) * 1000,
+    ratio_secundaria = (n_centros_sec / poblacion_total) * 1000,
+    ratio_centros_salud = (n_centros_salud / poblacion_total) * 1000,
+    ratio_hospitales = (n_hospitales / poblacion_total) * 1000,
+    ratio_farmacias = (n_farmacias / poblacion_total) * 1000,
+    ratio_tren = (n_tren / poblacion_total) * 1000,
+    ratio_autobus = (n_autobus / poblacion_total) * 1000,
+    ratio_lineas = (n_lineas / poblacion_total) * 1000,
+    ratio_interurbanas = (n_interurbanas / poblacion_total) * 1000,
+  ) |>
+  select(-starts_with("n_"), -poblacion_total)
+
+corr_ratios_sinM <- cor(ratios_sinMad, use = "complete.obs")
+```
+
+```{r}
+vars_ratio <- grep("^ratio_", names(ratios_sinMad), value = TRUE)
+vars_resto <- setdiff(names(ratios_sinMad), vars_ratio)
+sub_corr_matrix <- corr_ratios_sinM[vars_ratio, vars_resto]
+```
+
+```{r}
+corrplot(
+  sub_corr_matrix,
+  method = "color",
+  tl.col = "black",
+  tl.cex = 0.7,
+  col = colorRampPalette(c("#d6604d","white","#2166ac"))(200),
+  addCoef.col = "black",
+  number.cex = 0.5,
+  number.digits = 1,
+  title = "Correlación: Ratios con log en x e y sin Madrid",
+  mar = c(0,0,2,0)
+)
+```
+
+### Datos finales
+
+```{r}
+df_final <- df |>  select(-'% hombres', -'% extranjeros', -'hogares_hab', -'vivienda_hab') |>
+  mutate(across(-c(starts_with("%"), starts_with("dist_"), municipio, codigo_ine), log1p)) |> 
+  mutate(
+    ratio_infantil = (n_centros_infantil / poblacion_total) * 1000,
+    ratio_primaria = (n_centros_primaria / poblacion_total) * 1000,
+    ratio_secundaria = (n_centros_sec / poblacion_total) * 1000,
+    ratio_centros_salud = (n_centros_salud / poblacion_total) * 1000,
+    ratio_hospitales = (n_hospitales / poblacion_total) * 1000,
+    ratio_farmacias = (n_farmacias / poblacion_total) * 1000,
+    ratio_tren = (n_tren / poblacion_total) * 1000,
+    ratio_autobus = (n_autobus / poblacion_total) * 1000,
+    ratio_lineas = (n_lineas / poblacion_total) * 1000,
+    ratio_interurbanas = (n_interurbanas / poblacion_total) * 1000,
+  ) |>
+  select(-starts_with("n_"), -poblacion_total)
+
+y <- df_final |> 
+  select(municipio, starts_with("ratio_"))
+
+X <- df_final |> select(c(municipio, codigo_ine, starts_with("%"), superficie_km2, tasa_paro, empresas_hab, #vivienda_hab, 
+renta_bruta_hab, ciudad_dormitorio, starts_with("dist_")))
+```
+
+## Modelos
+
+### Componente espacial
+
+Obtenemos las geometrías municipales con mapSpain y construimos la matriz de contigüidad queen (vecinos que comparten frontera o vértice). A partir de ella calculamos el spatial lag de cada target: el promedio ponderado del número de servicios en los municipios colindantes. Esto captura si un municipio delega servicios en sus vecinos o actúa como núcleo proveedor de su corona.
+
+```{r}
+municipios_mad <- esp_get_munic(region = "Madrid") |> 
+  st_transform(crs = 25830) |> select(geometry, LAU_CODE)
+```
+
+```{r}
+X_sf <- X |>
+  mutate(LAU_CODE = str_sub(as.character(codigo_ine), 1, 5)) |>
+  left_join(municipios_mad, by = "LAU_CODE") |>
+  st_as_sf() |>
+  arrange(LAU_CODE)
+
+y_sf <- y |>
+  mutate(LAU_CODE = str_sub(
+    as.character(df |> filter(municipio %in% y$municipio) |> pull(codigo_ine)), 1, 5))
+```
+
+```{r}
+nb  <- poly2nb(X_sf, queen = TRUE)
+W   <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+cat("Municipios sin vecinos:", sum(spdep::card(nb) == 0), "\n")
+cat("Media de vecinos por municipio:", round(mean(spdep::card(nb)), 1), "\n")
+```
+
+```{r}
+PRED_COLS <- c("ratio_infantil","ratio_primaria","ratio_secundaria","ratio_centros_salud","ratio_hospitales","ratio_farmacias", "ratio_tren","ratio_autobus","ratio_lineas","ratio_interurbanas")
+
+y_ordered <- y |>
+  mutate(LAU_CODE = str_sub(
+    as.character(df |> filter(municipio %in% y$municipio) |> pull(codigo_ine)),
+    1, 5)) |>
+  arrange(LAU_CODE)
+
+lags <- map_dfc(PRED_COLS, function(r) {
+  vals <- y_ordered[[r]]
+  tibble(!!paste0("lag_", r) := lag.listw(W, vals, zero.policy = TRUE))
+})
+
+X_sf <- bind_cols(X_sf, lags)
+```
+
+```{r}
+coords <- st_centroid(X_sf) |> st_coordinates()
+plot(st_geometry(X_sf), border = "grey70", main = "Red de contigüidad queen")
+plot(nb, coords, add = TRUE, col = "#e74c3c", lwd = 0.4, points = FALSE)
+```
+
+#### Índice de Moran
+
+```{r}
+detectar_corona <- function(ratio_col, umbral_ratio = 1.5, umbral_pval = 0.05) {
+  
+  lag_col  <- paste0("lag_", ratio_col)
+  y_vals   <- y_ordered[[ratio_col]]
+  lag_vals <- X_sf[[lag_col]]
+  
+  ratio_corona <- ifelse(lag_vals > 0, y_vals / lag_vals, NA_real_)
+  
+  y_scale   <- scale(y_vals)[, 1]
+  lisa      <- localmoran(y_scale, W, alternative = "two.sided",
+                          zero.policy = TRUE)
+  lag_scale <- lag.listw(W, y_scale, zero.policy = TRUE)
+  
+  tipo_lisa <- case_when(
+    y_scale > 0 & lag_scale > 0 & lisa[, 5] < umbral_pval ~ "HH",
+    y_scale > 0 & lag_scale < 0 & lisa[, 5] < umbral_pval ~ "HL",
+    y_scale < 0 & lag_scale > 0 & lisa[, 5] < umbral_pval ~ "LH",
+    y_scale < 0 & lag_scale < 0 & lisa[, 5] < umbral_pval ~ "LL",
+    TRUE ~ "NS"
+  )
+  
+  X_sf |>
+    st_drop_geometry() |>
+    select(municipio, LAU_CODE) |>
+    mutate(
+      y_propio     = round(y_vals, 4),
+      y_vecinos    = round(lag_vals, 4),
+      ratio_corona = round(ratio_corona, 3),
+      moran_i      = round(lisa[, 1], 4),
+      pval_lisa    = round(lisa[, 5], 4),
+      tipo_lisa    = tipo_lisa,
+      es_corona    = tipo_lisa == "HL" |
+                     (ratio_corona >= umbral_ratio & !is.na(ratio_corona))
+    ) |>
+    arrange(desc(ratio_corona))
+}
+```
+
+```{r}
+coronas <- purrr::map(PRED_COLS, function(rc) {
+  detectar_corona(rc)
+}) |> set_names(PRED_COLS)
+
+resumen_corona <- map_dfr(PRED_COLS, function(rc) {
+  coronas[[rc]] |>
+    filter(es_corona) |>
+    mutate(servicio = rc)
+}) |>
+  group_by(municipio, LAU_CODE) |>
+  summarise(
+    n_servicios_corona = n(),
+    servicios          = paste(servicio, collapse = ", "),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_servicios_corona))
+
+cat("Municipios corona (referente en ≥1 servicio):\n")
+print(resumen_corona)
+```
+
+```{r}
+resumen_corona |> select(-LAU_CODE)
+```
+
+```{r}
+plot_mapa_corona <- function(ratio_col) {
+  
+  datos_mapa <- X_sf |>
+    select(geometry, municipio, LAU_CODE) |>
+    left_join(coronas[[ratio_col]] |>
+                select(LAU_CODE, ratio_corona, tipo_lisa, es_corona),
+              by = "LAU_CODE")
+  
+  ggplot(datos_mapa) +
+    geom_sf(aes(fill = tipo_lisa), color = "white", linewidth = .07) +
+    scale_fill_manual(
+      values = c(
+        "HH" = "#d6604d",
+        "HL" = "#f4a582",
+        "LH" = "#92c5de",
+        "LL" = "#2166ac",
+        "NS" = "#f0f0f0"
+      ),
+      name   = "Tipo LISA",
+      labels = c(
+        "HH" = "Alto-Alto (clúster)",
+        "HL" = "Alto-Bajo (corona)",
+        "LH" = "Bajo-Alto (periferia)",
+        "LL" = "Bajo-Bajo (clúster bajo)",
+        "NS" = "No significativo"
+      )
+    ) +
+    geom_sf_text(
+      data = datos_mapa |> filter(es_corona),
+      aes(label = municipio),
+      size = 2.5, color = "black", fontface = "bold",
+      check_overlap = TRUE
+    ) +
+    labs(
+      title    = paste("Municipios corona -", ratio_col)) +
+    theme_void(base_size = 10) +
+    theme(plot.title      = element_text(face = "bold"),
+          legend.position = "right")
+}
+
+for (ratio_col in PRED_COLS) {
+  print(plot_mapa_corona(ratio_col))
+}
+```
+
+```{r}
+walk(PRED_COLS, function(rc) {
+  df <- coronas[[rc]] |> filter(es_corona)
+  if (nrow(df) > 0) {
+    cat(sprintf("\n- %s - (%d municipios corona)\n", rc, nrow(df)))
+    print(df |> select(municipio, y_propio, y_vecinos,
+                       ratio_corona, tipo_lisa, pval_lisa))
+  }
+})
+```
+
+```{r}
+es_abastecedor_lisa <- map_dfc(PRED_COLS, function(rc) {
+  y_vals  <- y_ordered[[rc]]
+  y_scale <- scale(y_vals)[, 1]
+  lisa    <- localmoran(y_scale, W, zero.policy = TRUE)
+  lag_s   <- lag.listw(W, y_scale, zero.policy = TRUE)
+  tibble(!!rc := (y_scale > lag_s & lisa[, 5] < 0.05))
+})
+```
+
+```{r}
+conflicts_prefer(base::`:`)
+```
+
+```{r}
+dist_abast <- table(base::rowSums(es_abastecedor_lisa)) |> 
+  as.data.frame() |>
+  rename(n_servicios = Var1, municipios = Freq) |>
+  mutate(
+    n_servicios = as.integer(as.character(n_servicios)),
+    pct         = round(municipios / sum(municipios) * 100, 1)
+  )
+
+ggplot(dist_abast, aes(x = n_servicios, y = municipios)) +
+  geom_col(fill = "#5b8dd9", color = "white") +
+  geom_text(aes(label = paste0(municipios, "\n(", pct, "%)")), 
+            vjust = -0.3, size = 3) +
+  geom_vline(xintercept = 2.5, linetype = "dashed", 
+             color = "#d6604d", linewidth = 0.8) +
+  annotate("text", x = 1.7, y = max(dist_abast$municipios) * 0.9,
+           label = "umbral = 2", color = "#d6604d", size = 3.5, hjust = 0) +
+  scale_x_continuous(breaks = 0:10) +
+  labs(
+    x        = "Nº de servicios en los que es abastecedor",
+    y        = "Nº de municipios"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r}
+X_sf <- X_sf |>
+  mutate(
+    n_servicios_abastecedor = base::rowSums(es_abastecedor_lisa),
+    es_abastecedor          = n_servicios_abastecedor > 2
+  ) |> 
+  select(-n_servicios_abastecedor)
+```
+
+## Interacción de variables
+
+```{r}
+features_base <- X_sf |> st_drop_geometry() |>
+  select(-municipio, -codigo_ine, -LAU_CODE,
+         -starts_with("lag_")) |>
+  names()
+
+PRED_COLS <- c("ratio_infantil","ratio_primaria","ratio_secundaria",
+               "ratio_centros_salud","ratio_hospitales" ,"ratio_farmacias","ratio_tren","ratio_autobus","ratio_lineas","ratio_interurbanas")
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+```
+
+```{r}
+explorar_ratio <- function(ratio_col) {
+  # DATOS
+  lag_col <- paste0("lag_", ratio_col)
+ 
+  datos_sf <- X_sf |>
+    mutate(y = y_ordered[[ratio_col]]) |>
+    dplyr::select(all_of(c(features_base, lag_col, "y")))
+ 
+  datos <- datos_sf |>
+    st_drop_geometry() |>
+    mutate(across(everything(), as.numeric)) |>
+    drop_na()
+ 
+  # RF EXPLORATORIO
+  set.seed(42)
+ 
+  datos_clean <- datos |>
+    rename_with(~ str_replace_all(., "[^a-zA-Z0-9_]", "_")) |> 
+    rename_with(~ str_replace_all(., "^_+", "p_"))
+
+  y_vec <- datos_clean$y
+
+  rf_explore <- ranger(
+  x         = datos_clean |> dplyr::select(-y) |> as.data.frame(),
+  y         = y_vec,
+  num.trees     = 500,
+  max.depth     = 6,
+  min.node.size = 10,
+  mtry          = floor(sqrt(ncol(datos_clean) - 1)),
+  importance    = "permutation",
+  seed          = 42
+  )
+ 
+  cat("R² OOB:", round(rf_explore$r.squared, 3), "\n")
+ 
+  # VIP
+  vip_tbl <- vip::vi(rf_explore) |>
+    arrange(desc(Importance))
+ 
+  cat("\nVIP TOP 10:\n")
+  print(vip_tbl |> slice_head(n = 10))
+  
+  pred_rf <- Predictor$new(
+  model            = rf_explore,
+  data             = datos_clean |> dplyr::select(-y) |> as.data.frame(),
+  y                = y_vec,
+  predict.function = function(model, newdata) {
+    predict(model, data = as.data.frame(newdata))$predictions
+  }
+)
+ 
+  # PDP
+  plot_pdp <- function(variable) {
+
+  pd <- pdp::partial(
+    object    = rf_explore,
+    pred.var  = variable,
+    train     = datos_clean |> dplyr::select(-y) |> as.data.frame(),
+    quantiles = TRUE,
+    probs     = seq(0.05, 0.95, by = 0.05),
+    pred.fun  = function(object, newdata) {
+      predict(object, data = newdata)$predictions
+    }
+  )
+
+  autoplot(pd) +
+    theme_minimal(base_size = 9) +
+    labs(
+      title = paste0(ratio_col, " ~ ", variable),
+      x     = variable,
+      y     = "Efecto parcial"
+    )
+}
+
+vars_numericas <- datos_clean |> select(-y) |> names()
+ 
+  lista_pdp <- map(vars_numericas, plot_pdp)
+  p_pdp     <- wrap_plots(lista_pdp)
+  print(p_pdp)
+ 
+  # H-STATISTIC
+
+  top5_vars <- vip_tbl |>
+    slice_max(Importance, n = 5) |>
+    pull(Variable)
+ 
+  inter_global <- Interaction$new(
+    predictor = pred_rf,
+    grid.size = 30
+  )
+ 
+  inter_tbl <- tibble(
+    variable  = inter_global$results$.feature,
+    h_global  = inter_global$results$.interaction
+  ) |>
+    arrange(desc(h_global))
+ 
+  cat("\nH-statistic global:\n")
+  print(inter_tbl)
+ 
+  # H-STATISTIC POR PARES
+
+  inter_pares_tbl <- map_dfr(top5_vars, function(v) {
+ 
+    inter_v <- Interaction$new(
+      predictor = pred_rf,
+      feature   = v,
+      grid.size = 30
+    )
+ 
+    tibble(
+      var_principal = v,
+      var_secundaria = inter_v$results$.feature,
+      h_par          = inter_v$results$.interaction
+    )
+  })
+ 
+  cat("\nTop pares de interacción:\n")
+  print(
+    inter_pares_tbl |>
+      arrange(desc(h_par)) |>
+      slice_head(n = 10)
+  )
+ 
+  list(
+    ratio        = ratio_col,
+    rf           = rf_explore,
+    vip          = vip_tbl,
+    inter_global = inter_tbl,
+    inter_pares  = inter_pares_tbl,
+    pdp          = lista_pdp
+  )
+}
+```
+
+```{r}
+map <- purrr::map
+map_dfr <- purrr::map_dfr
+
+resultados_exploracion <- map(PRED_COLS, explorar_ratio)
+names(resultados_exploracion) <- PRED_COLS
+
+```
+
+```{r}
+vip_resumen <- map_dfr(
+  resultados_exploracion,
+  ~ .x$vip |> mutate(ratio = .x$ratio)
+) |>
+  group_by(Variable) |>
+  summarise(
+    importancia_media = mean(Importance, na.rm = TRUE),
+    n_targets_top10   = sum(base::rank(-Importance) <= 10),
+    .groups           = "drop"
+  ) |>
+  arrange(desc(importancia_media), desc(n_targets_top10))
+ 
+cat("RESUMEN VIP GLOBAL — candidatas a step_ns()\n")
+print(vip_resumen)
+```
+
+```{r}
+vip_resumen
+```
+
+```{r}
+vars_numericas <- resultados_exploracion[[1]]$rf$forest$independent.variable.names
+idx_dist <- which(vars_numericas %in% c("dist_hosp_cercano_km", "dist_capital_km"))
+
+map(resultados_exploracion, function(res) {
+  wrap_plots(res$pdp[idx_dist]) +
+    plot_annotation(title = res$ratio)
+})
+```
+
+dist_hosp_cercano_km: caída pronunciada en los primeros 0-10 km y luego se aplana. Estar cerca de un hospital importa mucho, pero a partir de 10 km ya da igual. Spline justificado.
+
+dist_capital_km: caída clara hasta 30-35 km y luego se aplana.
+
+```{r}
+inter_pares_resumen <- map_dfr(
+  resultados_exploracion,
+  ~ .x$inter_pares |> mutate(ratio = .x$ratio)
+) |>
+  group_by(var_principal, var_secundaria) |>
+  summarise(
+    h_medio   = mean(h_par, na.rm = TRUE),
+    n_targets = n_distinct(ratio),
+    .groups   = "drop"
+  ) |>
+  arrange(desc(h_medio), desc(n_targets))
+ 
+cat("RESUMEN INTERACCIONES POR PARES — candidatas a step_interact()\n")
+print(inter_pares_resumen |> slice_head(n = 15))
+```
+
+```{r}
+inter_pares_resumen
+```
+
+### División train/test
+
+```{r}
+set.seed(1234)
+split_espacial <- spatial_block_cv(X_sf, v = 5, method = "random")
+
+split_tt <- split_espacial$splits[[1]]
+train_sf <- analysis(split_tt)
+test_sf  <- assessment(split_tt)
+
+X_sf |>
+  mutate(partición = ifelse(LAU_CODE %in% train_sf$LAU_CODE, "Train", "Test")) |>
+  ggplot() +
+  geom_sf(aes(fill = partición), color = "white", linewidth = .07) +
+  scale_fill_manual(values = c("Train" = "#2166ac", "Test" = "#d6604d")) +
+  labs(title    = "Split espacial Train / Test",
+       subtitle = paste0("Train = ", nrow(train_sf), " mun - Test = ", nrow(test_sf), " mun")) +
+  theme_void(base_size = 11) +
+  theme(legend.position = "right")
+```
+
+### CV espacial y modelos simples
+
+Con 179 municipios y estructura espacial marcada, la validación cruzada aleatoria infla el R² al reutilizar vecinos entre train y test. Uso CV espacial con bloques geográficos contiguos para evaluar correctamente la capacidad de generalización.
+
+#### Setup: datos y CV espacial
+
+```{r}
+# CV espacial: bloques por contigüidad queen
+# spatial_block_cv agrupa municipios geográficamente contiguos en k folds
+
+set.seed(42)
+folds_espaciales <- spatial_block_cv(train_sf, v = 5, method = "random")
+
+autoplot(folds_espaciales) +
+  labs(title    = "CV espacial") +
+  theme_void(base_size = 10)
+```
+
+#### Grids de hiperparámetros
+
+```{r}
+# Grids intencionalmente pequeños por n=179
+
+# Ridge y Lasso
+grid_ridge_lasso <- grid_regular(
+  penalty(range = c(-4, 1), trans = log10_trans()),
+  levels = 30
+)
+
+# Elastic Net
+grid_enet <- grid_regular(
+  penalty(range = c(-4, 1), trans = log10_trans()),
+  dials::mixture(range = c(0, 1)),
+  levels = c(penalty = 20, mixture = 5)
+)
+
+# SVR RBF
+grid_svr <- grid_regular(
+  cost(range      = c(-2, 3), trans = log10_trans()),
+  rbf_sigma(range = c(-3, 0), trans = log10_trans()),
+  levels = c(cost = 10, rbf_sigma = 8)
+)
+
+# Decision Tree
+grid_tree <- grid_regular(
+  cost_complexity(range = c(-4, -1), trans = log10_trans()),
+  min_n(range = c(5, 30)),
+  levels = c(cost_complexity = 10, min_n = 4)
+)
+
+# Random Forest
+GRID_RF <- grid_regular(
+  mtry(range = c(2, 6)),
+  min_n(range = c(10, 30)),
+  levels = c(mtry = 4, min_n = 4)
+)
+
+# XGBoost
+set.seed(42)
+GRID_XGB <- tibble(
+  trees          = sample(100:400, 40, replace = TRUE),
+  tree_depth     = sample(c(2L, 3L), 40, replace = TRUE, prob = c(0.6, 0.4)),
+  learn_rate     = 10^runif(40, -2.5, -1),
+  loss_reduction = 10^runif(40, -0.5, 1),
+  mtry           = sample(2:5, 40, replace = TRUE),
+  min_n          = sample(10:25, 40, replace = TRUE),
+  sample_size    = runif(40, 0.5, 0.7)
+) |>
+  mutate(across(c(trees, mtry, min_n), as.integer))
+```
+
+#### Funciones de modelado
+
+```{r}
+# Recetas compartidas
+hacer_receta_norm <- function(datos) {
+  recipe(y ~ ., data = datos) |>
+    step_ns(dist_hosp_cercano_km, deg_free = 3) |>
+    step_ns(dist_capital_km, deg_free = 3) |>
+    step_normalize(all_numeric_predictors())
+}
+
+# Specs
+spec_ridge <- linear_reg(penalty = tune(), mixture = 0) |>
+  set_engine("glmnet")
+
+spec_lasso <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet")
+
+spec_enet <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet")
+
+spec_svr <- svm_rbf(cost = tune(), rbf_sigma = tune()) |>
+  set_engine("kernlab") |>
+  set_mode("regression")
+
+spec_tree <- decision_tree(
+  cost_complexity = tune(),
+  min_n           = tune()
+) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+spec_rf <- rand_forest(
+  mtry  = tune(),
+  min_n = tune(),
+  trees = 500
+) |>
+  set_engine("ranger", importance = "permutation", seed = 42) |>
+  set_mode("regression")
+
+spec_xgb <- boost_tree(
+  trees          = tune(),
+  tree_depth     = tune(),
+  learn_rate     = tune(),
+  loss_reduction = tune(),
+  mtry           = tune(),
+  min_n          = tune(),
+  sample_size    = tune()
+) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+```
+
+```{r}
+conflicts_prefer(yardstick::rmse)
+conflicts_prefer(yardstick::mae)
+conflicts_prefer(yardstick::rsq)
+```
+
+```{r}
+tunear_spatial <- function(ratio_col) {
+  
+  lag_col <- paste0("lag_", ratio_col)
+  
+  y_full <- setNames(y_ordered[[ratio_col]], X_sf$LAU_CODE)
+  
+  datos_sf <- X_sf |>
+    mutate(y = y_full[LAU_CODE]) |>
+    select(all_of(c("municipio", "LAU_CODE", features_base, lag_col, "y")))
+  
+  train_sf_t <- datos_sf[datos_sf$LAU_CODE %in% train_sf$LAU_CODE, ]
+  
+  train_tab_t <- train_sf_t |> st_drop_geometry() |>
+    select(-LAU_CODE, -municipio) |> mutate(across(everything(), as.numeric))
+  
+  filas_ok_tr <- complete.cases(train_tab_t)
+  train_sf_t  <- train_sf_t[filas_ok_tr, ]
+  train_tab_t <- train_tab_t[filas_ok_tr, ]
+  
+  set.seed(42)
+  folds_sf <- spatial_block_cv(train_sf_t, v = 5, method = "random")
+  
+  folds_target <- manual_rset(
+    splits = map(folds_sf$splits, function(s) {
+      idx_train <- as.integer(s, data = "analysis")
+      idx_test  <- as.integer(s, data = "assessment")
+      make_splits(
+        list(analysis   = idx_train,
+             assessment = idx_test),
+        data = train_tab_t
+      )
+    }),
+    ids = folds_sf$id
+  )
+  
+  rec_norm <- hacer_receta_norm(train_tab_t)
+  
+  wf_ridge <- workflow() |> add_recipe(rec_norm) |> add_model(spec_ridge)
+  wf_lasso <- workflow() |> add_recipe(rec_norm) |> add_model(spec_lasso)
+  wf_enet  <- workflow() |> add_recipe(rec_norm) |> add_model(spec_enet)
+  wf_tree  <- workflow() |> add_recipe(rec_norm) |> add_model(spec_tree)
+  wf_svr   <- workflow() |> add_recipe(rec_norm) |> add_model(spec_svr)
+  wf_rf    <- workflow() |> add_recipe(rec_norm) |> add_model(spec_rf)
+  wf_xgb   <- workflow() |> add_recipe(rec_norm) |> add_model(spec_xgb)
+  
+  met <- metric_set(rmse, mae, rsq)
+  
+  tune_res_ridge <- tune_grid(wf_ridge, resamples = folds_target, grid = grid_ridge_lasso, metrics = met)
+  tune_res_lasso <- tune_grid(wf_lasso, resamples = folds_target, grid = grid_ridge_lasso, metrics = met)
+  tune_res_enet  <- tune_grid(wf_enet,  resamples = folds_target, grid = grid_enet,        metrics = met)
+  tune_res_tree  <- tune_grid(wf_tree,  resamples = folds_target, grid = grid_tree,        metrics = met)
+  tune_res_svr   <- tune_grid(wf_svr,   resamples = folds_target, grid = grid_svr,         metrics = met)
+
+  n_pred <- ncol(train_tab_t) - 1L  # columnas menos 'y'
+  grid_rf_final <- GRID_RF |>
+    mutate(mtry = pmin(mtry, n_pred))
+  
+  set.seed(42)
+  tune_res_rf  <- tune_grid(wf_rf,  resamples = folds_target, grid = grid_rf_final,  metrics = met)
+  set.seed(42)
+  tune_res_xgb <- tune_grid(wf_xgb, resamples = folds_target, grid = GRID_XGB,       metrics = met)
+  
+  list(
+    ratio_col  = ratio_col,
+    train_tab  = train_tab_t,
+    train_sf   = train_sf_t,
+    lag_col    = lag_col,
+    rec_norm   = rec_norm,
+    wf_ridge = wf_ridge, wf_lasso = wf_lasso, wf_enet = wf_enet,
+    wf_tree  = wf_tree,  wf_svr   = wf_svr,   wf_rf   = wf_rf,
+    wf_xgb   = wf_xgb,
+    tune_ridge = tune_res_ridge, tune_lasso = tune_res_lasso, tune_enet = tune_res_enet,
+    tune_tree  = tune_res_tree,  tune_svr   = tune_res_svr,
+    tune_rf    = tune_res_rf,    tune_xgb   = tune_res_xgb
+  )
+}
+```
+
+```{r}
+ajustar_spatial <- function(t, forzar_modelo = NULL) {
+  
+  ratio_col <- t$ratio_col
+  
+  rmse_min <- function(tr) show_best(tr, metric = "rmse", n = 1)$mean
+  
+  comp <- tibble(
+    Modelo  = c("Ridge", "Lasso", "ElasticNet", "DecisionTree", "SVR", "RandomForest", "XGBoost"),
+    RMSE_CV = round(c(rmse_min(t$tune_ridge), rmse_min(t$tune_lasso),
+                      rmse_min(t$tune_enet),  rmse_min(t$tune_tree),
+                      rmse_min(t$tune_svr),   rmse_min(t$tune_rf),
+                      rmse_min(t$tune_xgb)), 4),
+    MAE_CV  = round(c(show_best(t$tune_ridge, n=1, metric="mae")$mean,
+                      show_best(t$tune_lasso, n=1, metric="mae")$mean,
+                      show_best(t$tune_enet,  n=1, metric="mae")$mean,
+                      show_best(t$tune_tree,  n=1, metric="mae")$mean,
+                      show_best(t$tune_svr,   n=1, metric="mae")$mean,
+                      show_best(t$tune_rf,    n=1, metric="mae")$mean,
+                      show_best(t$tune_xgb,   n=1, metric="mae")$mean), 4),
+    R2_CV   = round(c(show_best(t$tune_ridge, n=1, metric="rsq")$mean,
+                      show_best(t$tune_lasso, n=1, metric="rsq")$mean,
+                      show_best(t$tune_enet,  n=1, metric="rsq")$mean,
+                      show_best(t$tune_tree,  n=1, metric="rsq")$mean,
+                      show_best(t$tune_svr,   n=1, metric="rsq")$mean,
+                      show_best(t$tune_rf,    n=1, metric="rsq")$mean,
+                      show_best(t$tune_xgb,   n=1, metric="rsq")$mean), 4)
+  ) |>
+    arrange(RMSE_CV) |>
+    mutate(Mejor = ifelse(row_number() == 1, "★", ""))
+  
+    if (!is.null(forzar_modelo)) {
+      stopifnot(forzar_modelo %in% comp$Modelo)
+      mejor_nombre <- forzar_modelo
+      message(paste("Forzado:", mejor_nombre, "para", ratio_col))
+  } else {
+    mejor_nombre <- comp$Modelo[1]
+    message(paste("Seleccionado:", mejor_nombre, "para", ratio_col))
+  }
+  
+  wf_list <- list(
+    Ridge        = t$wf_ridge, Lasso        = t$wf_lasso,
+    ElasticNet   = t$wf_enet,  DecisionTree = t$wf_tree,
+    SVR          = t$wf_svr,   RandomForest = t$wf_rf,
+    XGBoost      = t$wf_xgb
+  )
+  best_params <- list(
+    Ridge        = select_best(t$tune_ridge, metric = "rmse"),
+    Lasso        = select_best(t$tune_lasso, metric = "rmse"),
+    ElasticNet   = select_best(t$tune_enet,  metric = "rmse"),
+    DecisionTree = select_best(t$tune_tree,  metric = "rmse"),
+    SVR          = select_best(t$tune_svr,   metric = "rmse"),
+    RandomForest = select_best(t$tune_rf,    metric = "rmse"),
+    XGBoost      = select_best(t$tune_xgb,   metric = "rmse")
+  )
+  
+  # Fit final sobre TODO train
+  final_wf  <- finalize_workflow(wf_list[[mejor_nombre]], best_params[[mejor_nombre]])
+  set.seed(42)
+  final_fit <- fit(final_wf, data = t$train_tab)
+  
+  # Construir test
+  y_full <- setNames(y_ordered[[t$ratio_col]], X_sf$LAU_CODE)
+  
+  test_sf_t <- X_sf[X_sf$LAU_CODE %in% test_sf$LAU_CODE, ] |>
+    mutate(y = y_full[LAU_CODE]) |>
+    select(all_of(c("municipio", "LAU_CODE", features_base, t$lag_col, "y")))
+  
+  test_full   <- test_sf_t |> st_drop_geometry() |>
+    mutate(across(-c(municipio, LAU_CODE), as.numeric))
+  filas_ok_te <- complete.cases(test_full |> select(-municipio, -LAU_CODE))
+  test_sf_t   <- test_sf_t[filas_ok_te, ]
+  test_tab_t  <- test_full[filas_ok_te, ] |> select(-municipio, -LAU_CODE)
+  
+  # Métricas train
+  preds_tr <- predict(final_fit, new_data = t$train_tab |> select(-y)) |>
+    bind_cols(t$train_tab |> select(y))
+  rmse_tr <- sqrt(mean((preds_tr$.pred - preds_tr$y)^2, na.rm = TRUE))
+  
+  # Métricas test
+  preds_te <- predict(final_fit, new_data = test_tab_t |> select(-y)) |>
+    bind_cols(test_tab_t |> select(y))
+  rmse_te <- sqrt(mean((preds_te$.pred - preds_te$y)^2, na.rm = TRUE))
+  mae_te  <- mean(abs(preds_te$.pred - preds_te$y), na.rm = TRUE)
+  r2_te   <- cor(preds_te$y, preds_te$.pred, use = "complete.obs")^2
+  
+  print(comp)
+  
+  p_vip <- NULL
+  if (mejor_nombre != "SVR") {
+    p_vip <- vip(final_fit) + labs(title = paste("VIP:", mejor_nombre, "-", ratio_col))
+  }
+  
+  p_pred <- ggplot(preds_te, aes(x = y, y = .pred)) +
+    geom_point(alpha = 0.6, color = "#d6604d") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.5,
+             label = paste0("R²=", round(r2_te, 3), "  RMSE=", round(rmse_te, 4)),
+             size = 3.5) +
+    labs(title    = paste("Real vs Predicho (TEST) —", ratio_col),
+         subtitle = paste("Modelo:", mejor_nombre),
+         x = "Real", y = "Predicho") +
+    theme_minimal(base_size = 10)
+  
+  list(
+    ratio_col           = ratio_col,
+    comp                = comp,
+    mejor_modelo_nombre = mejor_nombre,
+    wf_final            = final_wf,
+    fit                 = final_fit,
+    preds_train         = preds_tr,
+    preds_test          = preds_te,
+    test_sf             = test_sf_t,
+    rmse_tr             = rmse_tr,
+    rmse_te             = rmse_te,
+    r2_te               = r2_te,
+    p_vip               = p_vip,
+    p_pred              = p_pred
+  )
+}
+```
+
+```{r}
+# Diagnósticos
+plot_curva_lambda_spatial <- function(metricas, tipo, ratio_col) {
+  mejor <- metricas |> filter(.metric == "rmse") |> slice_min(mean, n = 1)
+  
+  metricas |>
+    filter(.metric == "rmse") |>
+    ggplot(aes(x = log10(penalty), y = mean)) +
+    geom_line(color = "#2980b9", linewidth = .9) +
+    geom_ribbon(aes(ymin = mean - std_err, ymax = mean + std_err),
+                alpha = .15, fill = "#2980b9") +
+    geom_vline(xintercept = log10(mejor$penalty),
+               linetype = "dashed", color = "black") +
+    annotate("text",
+             x = log10(mejor$penalty),
+             y = max(metricas$mean[metricas$.metric == "rmse"]),
+             label = paste0("λ*=", round(mejor$penalty, 4)),
+             hjust = -0.1, vjust = 1.3, size = 3) +
+    labs(title    = paste(tipo, "-", ratio_col),
+         x = "log10(λ)", y = "RMSE (CV espacial)") +
+    theme_minimal(base_size = 10)
+}
+
+plot_curva_enet_spatial <- function(metricas, ratio_col) {
+  mejor <- metricas |> filter(.metric == "rmse") |> slice_min(mean, n = 1)
+  
+  metricas |>
+    filter(.metric == "rmse") |>
+    mutate(mixture_f = factor(round(mixture, 2))) |>
+    ggplot(aes(x = log10(penalty), y = mean,
+               group = mixture_f, color = mixture_f)) +
+    geom_line(linewidth = .7, alpha = .8) +
+    geom_point(data = mejor, aes(x = log10(penalty), y = mean),
+               inherit.aes = FALSE, color = "black", size = 3, shape = 8) +
+    scale_color_viridis_d(option = "C", end = .85) +
+    labs(title    = paste("Elastic Net —", ratio_col),
+         subtitle = paste0("óptimo: λ=", round(mejor$penalty, 4),
+                           ", mixture=", round(mejor$mixture, 2)),
+         x = "log10(λ)", y = "RMSE (CV espacial)",
+         color = "mixture") +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom")
+}
+
+plot_real_vs_pred_spatial <- function(real, pred, muns, titulo) {
+  resid <- real - pred
+  datos <- tibble(municipio = muns, real, predicho = pred, residuo = resid) |>
+    mutate(etiqueta = ifelse(
+      abs(residuo) > quantile(abs(residuo), .90) | municipio == "Madrid",
+      municipio, ""))
+  rmse <- round(sqrt(mean(resid^2, na.rm = TRUE)), 4)
+  r2   <- round(cor(real, pred, use = "complete.obs")^2, 3)
+  mae  <- round(mean(abs(resid), na.rm = TRUE), 4)
+  ggplot(datos, aes(x = predicho, y = real)) +
+    geom_point(aes(color = residuo), alpha = .75, size = 2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey30") +
+    geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = .5) +
+    geom_text_repel(aes(label = etiqueta), size = 2.5, max.overlaps = 15) +
+    scale_color_gradient2(low = "#2166ac", mid = "grey85", high = "#d6604d",
+                          midpoint = 0, name = "Residuo") +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+         label = paste0("R²=", r2, "  RMSE=", rmse, "  MAE=", mae), size = 3.5) +
+    labs(title    = paste("Real vs Predicho (TEST) -", titulo),
+         subtitle = paste0("n=", nrow(datos)),
+         x = "Predicho", y = "Real") +
+    theme_minimal(base_size = 10)
+}
+
+plot_importancia_spatial <- function(wf_final, titulo, top_n = 12) {
+  extract_fit_parsnip(wf_final) |>
+    vip::vi() |>
+    slice_max(Importance, n = top_n) |>
+    mutate(
+      Variable  = fct_reorder(Variable, Importance),
+      categoria = case_when(
+        str_detect(Variable, "^lag_") ~ "Spatial lag",
+        str_detect(Variable, "^%")    ~ "Porcentaje",
+        TRUE                          ~ "Socioeconómica"
+      )
+    ) |>
+    ggplot(aes(x = Variable, y = Importance, fill = categoria)) +
+    geom_col() + coord_flip() +
+    scale_fill_manual(values = c("Spatial lag"    = "#e74c3c",
+                                  "Socioeconómica" = "#3498db",
+                                  "Porcentaje"     = "#95a5a6")) +
+    labs(title    = paste("Importancia -", titulo),
+         subtitle = paste0("Top ", top_n, " · CV espacial"),
+         x = NULL, y = "Importancia", fill = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom")
+}
+
+diagnostico_spatial <- function(r) {
+
+  ratio_col <- r$ratio_col
+
+  # 1. Diagnóstico específico por tipo de modelo
+
+  if (r$mejor_modelo_nombre %in% c("Ridge", "Lasso", "ElasticNet")) {
+
+    cat("\n--- Coeficientes del modelo lineal seleccionado ---\n")
+    coefs <- r$fit |>
+      extract_fit_parsnip() |>
+      tidy() |>
+      filter(estimate != 0) |>
+      arrange(desc(abs(estimate)))
+    print(coefs)
+    
+    resid_lin <- r$preds_test$y - r$preds_test$.pred
+
+  test_norm <- shapiro.test(resid_lin)
+
+  cat(sprintf(
+    "\n--- Test de normalidad de residuos (Shapiro-Wilk) ---\n  W = %.4f  |  p-value = %.4f\n  %s\n",
+    test_norm$statistic,
+    test_norm$p.value,
+    ifelse(test_norm$p.value > 0.05,
+           "No se rechaza normalidad (p > 0.05)",
+           "Se rechaza normalidad (p <= 0.05)")
+  ))
+
+  p_qq <- ggplot(tibble(resid = resid_lin), aes(sample = resid)) +
+    stat_qq(color = "#2980b9", alpha = .75, size = 1.8) +
+    stat_qq_line(color = "grey30", linetype = "dashed", linewidth = .6) +
+    annotate("text",
+             x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5, size = 3,
+             label = paste0("Shapiro-Wilk: W=", round(test_norm$statistic, 4),
+                            "  p=", round(test_norm$p.value, 4))) +
+    labs(title    = paste("Q-Q plot residuos —", ratio_col),
+         subtitle = "Test vs distribución normal teórica",
+         x = "Cuantiles teóricos", y = "Cuantiles muestrales") +
+    theme_minimal(base_size = 10)
+
+  p_hist <- ggplot(tibble(resid = resid_lin), aes(x = resid)) +
+    geom_histogram(aes(y = after_stat(density)),
+                   bins = 20, fill = "#2980b9", color = "white", alpha = .7) +
+    stat_function(fun  = dnorm,
+                  args = list(mean = mean(resid_lin, na.rm = TRUE),
+                              sd   = sd(resid_lin,   na.rm = TRUE)),
+                  color = "grey30", linewidth = .8, linetype = "dashed") +
+    labs(title    = paste("Distribución residuos —", ratio_col),
+         x = "Residuo", y = "Densidad") +
+    theme_minimal(base_size = 10)
+
+  print(p_qq + p_hist + patchwork::plot_layout(ncol = 2))
+
+  } else if (r$mejor_modelo_nombre == "DecisionTree") {
+
+    cat("\n--- Árbol de decisión (rpart.plot) ---\n")
+    arbol_rpart <- r$fit |>
+      extract_fit_parsnip() |>
+      pluck("fit")
+    rpart.plot(
+      arbol_rpart,
+      type        = 4,
+      extra       = 101,
+      fallen.leaves = TRUE,
+      cex         = 0.7,
+      main        = paste("Árbol de decisión —", ratio_col)
+    )
+
+    cat("\n--- Importancia de variables (Decision Tree) ---\n")
+    print(plot_importancia_spatial(r$fit, ratio_col))
+
+  } else if (r$mejor_modelo_nombre == "RandomForest") {
+
+    cat("\n--- Importancia de variables (Random Forest) ---\n")
+    print(plot_importancia_spatial(r$fit, ratio_col))
+
+    # OOB R² del modelo final
+    rf_engine <- extract_fit_parsnip(r$fit)$fit
+    cat(sprintf("\nR² OOB del RF final: %.4f\n", rf_engine$r.squared))
+
+  } else if (r$mejor_modelo_nombre == "XGBoost") {
+
+    cat("\n--- Importancia de variables (XGBoost) ---\n")
+    print(plot_importancia_spatial(r$fit, ratio_col))
+
+  } else if (r$mejor_modelo_nombre == "SVR") {
+
+    cat("\n--- Importancia por permutación (SVR) ---\n")
+
+    set.seed(42)
+
+    datos_test_svr <- r$test_sf |>
+      st_drop_geometry() |>
+      select(-municipio, -LAU_CODE) |>
+      mutate(across(everything(), as.numeric))
+
+    y_test_svr    <- datos_test_svr$y
+    datos_test_svr <- datos_test_svr |> select(-y)
+
+    pred_base <- predict(r$fit, new_data = datos_test_svr)$.pred
+    rmse_base <- sqrt(mean((pred_base - y_test_svr)^2, na.rm = TRUE))
+
+    imp_perm <- map_dfr(names(datos_test_svr), function(v) {
+      datos_perm      <- datos_test_svr
+      datos_perm[[v]] <- sample(datos_perm[[v]])
+      pred_perm       <- predict(r$fit, new_data = datos_perm)$.pred
+      tibble(
+        Variable   = v,
+        Importance = sqrt(mean((pred_perm - y_test_svr)^2, na.rm = TRUE)) - rmse_base
+      )
+    }) |>
+      arrange(desc(Importance))
+
+    cat("Top 5 variables por permutación:\n")
+    print(imp_perm |> slice_head(n = 5))
+
+    p_imp_svr <- imp_perm |>
+      slice_max(Importance, n = 12) |>
+      mutate(
+        Variable  = fct_reorder(Variable, Importance),
+        categoria = case_when(
+          str_detect(Variable, "^lag_") ~ "Spatial lag",
+          str_detect(Variable, "^p_")   ~ "Porcentaje",
+          TRUE                          ~ "Socioeconómica"
+        )
+      ) |>
+      ggplot(aes(x = Variable, y = Importance, fill = categoria)) +
+      geom_col() + coord_flip() +
+      scale_fill_manual(values = c("Spatial lag"    = "#e74c3c",
+                                    "Socioeconómica" = "#3498db",
+                                    "Porcentaje"     = "#95a5a6")) +
+      labs(
+        title    = paste("Importancia por permutación (SVR) ", ratio_col),
+        x = NULL, y = "incremento RMSE", fill = NULL
+      ) +
+      theme_minimal(base_size = 10) +
+      theme(legend.position = "bottom")
+
+    print(p_imp_svr)
+
+    # Residuos por decil de predicho
+    cat("\n--- Residuos por decil (SVR) ---\n")
+
+    p_resid_decil <- tibble(
+      predicho = pred_base,
+      y        = y_test_svr
+    ) |>
+      mutate(
+        residuo = y - predicho,
+        decil   = ntile(predicho, 10)
+      ) |>
+      group_by(decil) |>
+      summarise(
+        rmse_decil = sqrt(mean(residuo^2, na.rm = TRUE)),
+        mae_decil  = mean(abs(residuo), na.rm = TRUE),
+        .groups    = "drop"
+      ) |>
+      ggplot(aes(x = factor(decil), y = rmse_decil)) +
+      geom_col(fill = "#8e44ad", alpha = 0.8) +
+      geom_line(aes(y = mae_decil, group = 1), color = "#e74c3c",
+                linewidth = 0.8, linetype = "dashed") +
+      geom_point(aes(y = mae_decil), color = "#e74c3c", size = 2) +
+      labs(
+        title    = paste("Error por decil predicho (SVR) -", ratio_col),
+        x        = "Decil (1 = valores más bajos predichos)",
+        y        = "Error"
+      ) +
+      theme_minimal(base_size = 10)
+
+    print(p_resid_decil)
+  }
+
+  # 2. Real vs predicho (TEST)
+  print(
+    plot_real_vs_pred_spatial(
+      real   = r$preds_test$y,
+      pred   = r$preds_test$.pred,
+      muns   = as.character(r$test_sf$municipio),
+      titulo = ratio_col
+    )
+  )
+
+  #  3. Importancia de variables en modelos que la tienen directamente
+  if (r$mejor_modelo_nombre %in% c("Ridge", "Lasso", "ElasticNet", "DecisionTree")) {
+    print(plot_importancia_spatial(r$fit, ratio_col))
+  }
+}
+```
+
+#### Entrenamiento y diagnóstico por target
+
+```{r}
+todos_resultados <- list()
+```
+
+```{r}
+# ratio_infantil
+tune_infantil <- tunear_spatial("ratio_infantil")
+res_infantil  <- ajustar_spatial(tune_infantil)
+todos_resultados[["ratio_infantil"]] <- res_infantil
+```
+
+```{r}
+diagnostico_spatial(res_infantil)
+```
+
+```{r}
+# ratio_primaria
+tune_primaria <- tunear_spatial("ratio_primaria")
+res_primaria  <- ajustar_spatial(tune_primaria)
+todos_resultados[["ratio_primaria"]] <- res_primaria
+```
+
+```{r}
+diagnostico_spatial(res_primaria)
+```
+
+```{r}
+# ratio_secundaria
+tune_secundaria <- tunear_spatial("ratio_secundaria")
+res_secundaria  <- ajustar_spatial(tune_secundaria)
+todos_resultados[["ratio_secundaria"]] <- res_secundaria
+```
+
+```{r}
+diagnostico_spatial(res_secundaria)
+```
+
+```{r}
+# ratio_centros_salud
+tune_centros_salud <- tunear_spatial("ratio_centros_salud")
+res_centros_salud  <- ajustar_spatial(tune_centros_salud)
+todos_resultados[["ratio_centros_salud"]] <- res_centros_salud
+```
+
+```{r}
+diagnostico_spatial(res_centros_salud)
+```
+
+```{r}
+res_centros_salud_v2 <- ajustar_spatial(tune_centros_salud, forzar_modelo = "ElasticNet")
+diagnostico_spatial(res_centros_salud_v2)
+```
+
+```{r}
+todos_resultados[["ratio_centros_salud"]] <- res_centros_salud_v2
+```
+
+```{r}
+# ratio_hospitales
+tune_hospitales <- tunear_spatial("ratio_hospitales")
+res_hospitales  <- ajustar_spatial(tune_hospitales)
+todos_resultados[["ratio_hospitales"]] <- res_hospitales
+```
+
+```{r}
+diagnostico_spatial(res_hospitales)
+```
+
+```{r}
+# ratio_farmacias
+tune_farmacias <- tunear_spatial("ratio_farmacias")
+res_farmacias  <- ajustar_spatial(tune_farmacias)
+todos_resultados[["ratio_farmacias"]] <- res_farmacias
+```
+
+```{r}
+diagnostico_spatial(res_farmacias)
+```
+
+```{r}
+# ratio_tren
+tune_tren <- tunear_spatial("ratio_tren")
+res_tren  <- ajustar_spatial(tune_tren)
+todos_resultados[["ratio_tren"]] <- res_tren
+```
+
+```{r}
+diagnostico_spatial(res_tren)
+```
+
+```{r}
+res_tren_v2 <- ajustar_spatial(tune_tren, forzar_modelo = "RandomForest")
+diagnostico_spatial(res_tren_v2)
+```
+
+```{r}
+todos_resultados[["ratio_tren"]] <- res_tren_v2
+```
+
+```{r}
+# ratio_autobus
+tune_autobus <- tunear_spatial("ratio_autobus")
+res_autobus  <- ajustar_spatial(tune_autobus)
+todos_resultados[["ratio_autobus"]] <- res_autobus
+```
+
+```{r}
+diagnostico_spatial(res_autobus)
+```
+
+```{r}
+res_autobus_v2 <- ajustar_spatial(tune_autobus, forzar_modelo = "XGBoost")
+diagnostico_spatial(res_autobus_v2)
+```
+
+```{r}
+todos_resultados[["ratio_autobus"]] <- res_autobus_v2
+```
+
+```{r}
+# ratio_lineas
+tune_lineas <- tunear_spatial("ratio_lineas")
+res_lineas  <- ajustar_spatial(tune_lineas)
+todos_resultados[["ratio_lineas"]] <- res_lineas
+```
+
+```{r}
+diagnostico_spatial(res_lineas)
+```
+
+```{r}
+# ratio_interurbanas
+tune_interurbanas <- tunear_spatial("ratio_interurbanas")
+res_interurbanas  <- ajustar_spatial(tune_interurbanas)
+todos_resultados[["ratio_interurbanas"]] <- res_interurbanas
+```
+
+```{r}
+diagnostico_spatial(res_interurbanas)
+```
+
+#### Resumen comparativo
+
+```{r}
+resumen_modelos <- map_dfr(PRED_COLS, function(rc) {
+  r <- todos_resultados[[rc]]
+  tibble(
+    Target     = rc,
+    Modelo     = r$mejor_modelo_nombre,
+    RMSE_train = round(r$rmse_tr, 4),
+    RMSE_test  = round(r$rmse_te, 4),
+    R2_test    = round(r$r2_te,   4))
+}) |>
+  arrange(desc(R2_test))
+
+print(resumen_modelos)
+```
+
+```{r}
+resumen_modelos
+```
+
+### Predicciones y déficit
+
+```{r}
+resultados_pred <- X_sf |>
+  st_drop_geometry() |>
+  select(municipio, LAU_CODE)
+
+for (ratio_col in PRED_COLS) {
+  
+  res     <- todos_resultados[[ratio_col]]
+  lag_col <- paste0("lag_", ratio_col)
+  
+  datos_full <- X_sf |>
+    st_drop_geometry() |>
+    select(all_of(c(features_base, lag_col))) |>
+    mutate(across(everything(), as.numeric),
+           y = y_ordered[[ratio_col]])
+  
+  real <- y_ordered[[ratio_col]]
+  pred <- predict(res$fit, new_data = datos_full)$.pred
+  
+  resultados_pred[[paste0("pred_",    ratio_col)]] <- round(pred, 3)
+  resultados_pred[[paste0("real_",    ratio_col)]] <- round(real, 3)
+  resultados_pred[[paste0("deficit_", ratio_col)]] <- round(real - pred, 3)
+}
+
+resultados_pred
+```
+
+#### Real vs predicho - dataset completo
+
+```{r}
+# Gráfico real vs predicho sobre todos los municipios (train + test)
+for (ratio_col in PRED_COLS) {
+  
+  res     <- todos_resultados[[ratio_col]]
+  lag_col <- paste0("lag_", ratio_col)
+  
+  datos_full <- X_sf |>
+    st_drop_geometry() |>
+    select(all_of(c(features_base, lag_col))) |>
+    mutate(across(everything(), as.numeric),
+           y = y_ordered[[ratio_col]])
+  
+  real_all <- datos_full$y
+  pred_all <- predict(res$fit, new_data = datos_full)$.pred
+  muns_all <- X_sf$municipio
+  
+  # Identificar si el municipio fue train o test
+  particion <- ifelse(X_sf$LAU_CODE %in% train_sf$LAU_CODE, "Train", "Test")
+  
+  resid_all <- real_all - pred_all
+  rmse_all  <- round(sqrt(mean(resid_all^2, na.rm = TRUE)), 4)
+  r2_all    <- round(cor(real_all, pred_all, use = "complete.obs")^2, 3)
+  mae_all   <- round(mean(abs(resid_all), na.rm = TRUE), 4)
+  
+  datos_plot <- tibble(
+    municipio = as.character(muns_all),
+    real      = real_all,
+    predicho  = pred_all,
+    residuo   = resid_all,
+    particion = particion
+  ) |>
+    mutate(etiqueta = ifelse(
+      abs(residuo) > quantile(abs(residuo), .90, na.rm = TRUE) | municipio == "Madrid",
+      municipio, ""))
+  
+  p_full <- ggplot(datos_plot, aes(x = predicho, y = real)) +   # ← intercambiado
+    geom_point(aes(color = particion, shape = particion), alpha = 0.75, size = 2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey30") +
+    geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.5) +
+    geom_text_repel(aes(label = etiqueta), size = 2.5, max.overlaps = 15) +
+    scale_color_manual(values = c("Train" = "#2166ac", "Test" = "#d6604d")) +
+    scale_shape_manual(values = c("Train" = 16, "Test" = 17)) +
+    annotate("label", x = Inf, y = -Inf, hjust = 1.05, vjust = -0.1,
+         label = paste0("R²=", r2_all, "\nRMSE=", rmse_all, "\nMAE=", mae_all), size = 3.2, fill = "white", linewidth = 0.3) +
+    labs(
+      title    = paste("Real vs Predicho -", ratio_col),
+      subtitle = paste0("Modelo: ", res$mejor_modelo_nombre),
+      x        = "Predicho",
+      y        = "Real",
+      color    = "Partición",
+      shape    = "Partición"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "right")
+  
+  print(p_full)
+}
+```
+
+```{r}
+mapa_resultados <- X_sf |>
+  select(geometry, municipio, LAU_CODE) |>
+  left_join(resultados_pred, by = c("municipio","LAU_CODE"))
+```
+
+```{r}
+plot_mapa_deficit <- function(ratio_col, mapa_sf, titulo = NULL) {
+  col_def <- paste0("deficit_", ratio_col)
+  lim     <- max(abs(mapa_sf[[col_def]]), na.rm = TRUE)
+  tit     <- if (!is.null(titulo)) titulo else paste("Déficit -", ratio_col)
+
+  ggplot(mapa_sf) +
+    geom_sf(aes(fill = !!sym(col_def)), color = "white", linewidth = .07) +
+    scale_fill_gradient2(
+      low      = "#d6604d",
+      mid      = "#f7f7f7",
+      high     = "#2166ac",
+      midpoint = 0,
+      limits   = c(-lim, lim),
+      name     = "Real - Pred"
+    ) +
+    labs(title    = tit,
+         subtitle = "Rojo = faltan servicios - Azul = sobran - Blanco = equilibrio") +
+    theme_void(base_size = 10) +
+    theme(plot.title = element_text(face = "bold"),
+          legend.position = "right")
+}
+```
+
+```{r}
+#| fig-height: 8
+for (ratio_col in PRED_COLS) {
+  print(plot_mapa_deficit(ratio_col, mapa_resultados))
+}
+```
+
+```{r}
+pob_ordenada <- X_sf |>
+  st_drop_geometry() |>
+  select(municipio) |>
+  left_join(
+    df |> select(municipio, poblacion_total),
+    by = "municipio"
+  )
+
+resultados_pred_n <- resultados_pred |>
+  bind_cols(pob_ordenada |> select(poblacion_total)) |>
+  mutate(pob_log = log1p(poblacion_total)) |>
+  mutate(
+    across(starts_with("real_ratio_"),
+           ~ round(expm1(. * pob_log / 1000)),
+           .names = "{str_replace(.col, 'real_ratio_', 'n_real_')}"),
+    across(starts_with("pred_ratio_"),
+           ~ round(expm1(. * pob_log / 1000)),
+           .names = "{str_replace(.col, 'pred_ratio_', 'n_pred_')}")
+  ) |>
+  mutate(
+    n_deficit_infantil      = n_real_infantil      - n_pred_infantil,
+    n_deficit_primaria      = n_real_primaria      - n_pred_primaria,
+    n_deficit_secundaria    = n_real_secundaria    - n_pred_secundaria,
+    n_deficit_centros_salud = n_real_centros_salud - n_pred_centros_salud,
+    n_deficit_hospitales    = n_real_hospitales    - n_pred_hospitales,
+    n_deficit_farmacias     = n_real_farmacias     - n_pred_farmacias,
+    n_deficit_tren          = n_real_tren          - n_pred_tren,
+    n_deficit_autobus       = n_real_autobus       - n_pred_autobus,
+    n_deficit_lineas        = n_real_lineas        - n_pred_lineas,
+    n_deficit_interurbanas  = n_real_interurbanas  - n_pred_interurbanas
+  ) |>
+  select(-pob_log) |>
+  select(municipio, poblacion_total, LAU_CODE, starts_with("n_"))
+```
+
+```{r}
+resultados_pred_n
+```
+
+```{r}
+#saveRDS(resultados_pred_n, "resultados_prediccion.rds")
+```
