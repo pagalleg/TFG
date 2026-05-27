@@ -212,6 +212,7 @@ dim(df_final)
 ### Nivel de estudios
 
 ```{r}
+#YA NO ESTÁN DISPONIBLES
 url_estudios <- "https://datos.comunidad.madrid/catalogo/api/action/datastore_search"
 
 payload_estudios <- list(
@@ -694,8 +695,15 @@ df_censo <- df_censo_raw |>
 ```
 
 ```{r}
-hist(df_censo$`% trabaja_mismo_mun`, breaks = 10)
-hist(log(df_censo$`% trabaja_mismo_mun`), breaks = 10)
+hist(df_censo$`% trabaja_mismo_mun`,
+     breaks = 10,
+     main = "Personas que trabajan en el mismo municipio en el que residen",
+     xlab = "Porcentaje de población",
+     ylab = "Frecuencia")
+hist(log(df_censo$`% trabaja_mismo_mun`), breaks = 10,
+     main = "Logaritmo de personas que trabajan en el mismo municipio en el que residen",
+     xlab = "Porcentaje de población",
+     ylab = "Frecuencia")
 ```
 
 ```{r}
